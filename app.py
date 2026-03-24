@@ -16,6 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import numpy as np
+import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 # 確保可 import tw_index_futur
@@ -433,6 +434,74 @@ st.markdown(
 # 交易時段每分鐘更新；其餘時段每 30 分鐘更新。
 _refresh_sec = 60 if _is_market_open_now() else 1800
 st_autorefresh(interval=_refresh_sec * 1000, limit=None, key="long_underwater_dynamic_refresh")
+components.html(
+    """
+    <script>
+    (() => {
+      const PARENT = window.parent;
+      if (!PARENT || PARENT.__longUnderwaterPullRefreshInit) return;
+      PARENT.__longUnderwaterPullRefreshInit = true;
+
+      let startY = 0;
+      let pulling = false;
+      let reloading = false;
+      const THRESHOLD = 95;
+
+      function showHint(text) {
+        if (!PARENT.document || !PARENT.document.body) return;
+        const id = "long-underwater-pull-refresh-hint";
+        let el = PARENT.document.getElementById(id);
+        if (!el) {
+          el = PARENT.document.createElement("div");
+          el.id = id;
+          el.style.position = "fixed";
+          el.style.top = "12px";
+          el.style.left = "50%";
+          el.style.transform = "translateX(-50%)";
+          el.style.padding = "6px 10px";
+          el.style.borderRadius = "999px";
+          el.style.background = "rgba(17,24,39,0.88)";
+          el.style.color = "#fff";
+          el.style.fontSize = "12px";
+          el.style.zIndex = "99999";
+          el.style.pointerEvents = "none";
+          el.style.opacity = "0";
+          el.style.transition = "opacity .2s ease";
+          PARENT.document.body.appendChild(el);
+        }
+        el.textContent = text;
+        el.style.opacity = "1";
+        setTimeout(() => { el.style.opacity = "0"; }, 800);
+      }
+
+      PARENT.addEventListener("touchstart", (e) => {
+        if ((PARENT.scrollY || 0) > 0 || reloading) {
+          pulling = false;
+          return;
+        }
+        startY = e.touches?.[0]?.clientY ?? 0;
+        pulling = true;
+      }, { passive: true });
+
+      PARENT.addEventListener("touchmove", (e) => {
+        if (!pulling || reloading) return;
+        const currentY = e.touches?.[0]?.clientY ?? startY;
+        const dy = currentY - startY;
+        if (dy > THRESHOLD && (PARENT.scrollY || 0) <= 0) {
+          reloading = true;
+          showHint("重新整理中…");
+          setTimeout(() => { PARENT.location.reload(); }, 120);
+        }
+      }, { passive: true });
+
+      PARENT.addEventListener("touchend", () => {
+        pulling = false;
+      }, { passive: true });
+    })();
+    </script>
+    """,
+    height=0,
+)
 
 with st.sidebar:
     ticker = st.text_input("股票代號", value="^TWII")

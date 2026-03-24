@@ -138,94 +138,6 @@ def _is_after_1500() -> bool:
     return datetime.now().time() >= time(15, 0)
 
 
-def _enable_pull_to_refresh() -> None:
-    """手機端下拉刷新：在頁面頂部向下拉超過門檻時，觸發 reload。"""
-    components.html(
-        """
-        <div id="ptr-indicator">下拉可刷新</div>
-        <script>
-        (function () {
-          if (window.__streamlitPullToRefreshBound) return;
-          window.__streamlitPullToRefreshBound = true;
-
-          const THRESHOLD = 95;
-          let startY = 0;
-          let pulling = false;
-          let fired = false;
-          const indicator = document.getElementById("ptr-indicator");
-
-          function getScrollTop() {
-            const root = document.scrollingElement || document.documentElement || document.body;
-            return root ? root.scrollTop : 0;
-          }
-
-          function setHint(text, visible) {
-            if (!indicator) return;
-            indicator.textContent = text;
-            indicator.style.opacity = visible ? "1" : "0";
-          }
-
-          window.addEventListener("touchstart", function (e) {
-            if (!e.touches || e.touches.length !== 1) return;
-            if (getScrollTop() > 0) return;
-            startY = e.touches[0].clientY;
-            pulling = true;
-            fired = false;
-          }, { passive: true });
-
-          window.addEventListener("touchmove", function (e) {
-            if (!pulling || fired || !e.touches || e.touches.length !== 1) return;
-            const deltaY = e.touches[0].clientY - startY;
-            if (deltaY <= 0) {
-              setHint("下拉可刷新", false);
-              return;
-            }
-            if (getScrollTop() > 0) {
-              pulling = false;
-              setHint("下拉可刷新", false);
-              return;
-            }
-            if (deltaY > THRESHOLD) {
-              setHint("刷新中...", true);
-              fired = true;
-              window.location.reload();
-            } else {
-              setHint("繼續下拉以刷新", true);
-            }
-          }, { passive: true });
-
-          window.addEventListener("touchend", function () {
-            pulling = false;
-            fired = false;
-            setHint("下拉可刷新", false);
-          }, { passive: true });
-
-          setHint("下拉可刷新", false);
-        })();
-        </script>
-        <style>
-          #ptr-indicator {
-            position: fixed;
-            top: 8px;
-            left: 50%;
-            transform: translateX(-50%);
-            z-index: 99999;
-            background: rgba(17, 24, 39, 0.82);
-            color: #fff;
-            font-size: 12px;
-            line-height: 1;
-            padding: 7px 10px;
-            border-radius: 999px;
-            pointer-events: none;
-            opacity: 0;
-            transition: opacity 0.18s ease;
-          }
-        </style>
-        """,
-        height=0,
-    )
-
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | None, str | None]:
     """
@@ -368,7 +280,6 @@ def _render_bottom_strategy_panel(
 
 
 st.set_page_config(page_title="做多段日線鑽取", layout="wide")
-_enable_pull_to_refresh()
 # 行動裝置優化：縮小字級與留白，讓單手滑動閱讀更順。
 st.markdown(
     """
@@ -520,6 +431,78 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# 行動端手勢：頁面最上方下拉可重新整理（Pull-to-Refresh）
+components.html(
+    """
+    <script>
+    (function () {
+      if (window.__longUnderwaterPtrMounted) return;
+      window.__longUnderwaterPtrMounted = true;
+
+      let startY = 0;
+      let pulling = false;
+      let triggered = false;
+      const threshold = 85;
+
+      const hint = document.createElement("div");
+      hint.textContent = "下拉更新中...";
+      hint.style.position = "fixed";
+      hint.style.top = "10px";
+      hint.style.left = "50%";
+      hint.style.transform = "translateX(-50%)";
+      hint.style.background = "rgba(17, 24, 39, 0.86)";
+      hint.style.color = "#fff";
+      hint.style.fontSize = "13px";
+      hint.style.padding = "6px 10px";
+      hint.style.borderRadius = "999px";
+      hint.style.zIndex = "9999";
+      hint.style.opacity = "0";
+      hint.style.transition = "opacity 0.16s ease";
+      document.body.appendChild(hint);
+
+      function pageAtTop() {
+        return (window.scrollY || window.pageYOffset || 0) <= 0;
+      }
+
+      function showHint(show) {
+        hint.style.opacity = show ? "1" : "0";
+      }
+
+      window.addEventListener("touchstart", function (e) {
+        if (!e.touches || e.touches.length !== 1) return;
+        if (!pageAtTop()) return;
+        startY = e.touches[0].clientY;
+        pulling = true;
+        triggered = false;
+      }, { passive: true });
+
+      window.addEventListener("touchmove", function (e) {
+        if (!pulling || triggered) return;
+        if (!e.touches || e.touches.length !== 1) return;
+        const currentY = e.touches[0].clientY;
+        const deltaY = currentY - startY;
+        if (deltaY > 18) showHint(true);
+        if (deltaY > threshold && pageAtTop()) {
+          triggered = true;
+          showHint(true);
+          window.setTimeout(function () {
+            window.location.reload();
+          }, 40);
+        }
+      }, { passive: true });
+
+      window.addEventListener("touchend", function () {
+        pulling = false;
+        if (!triggered) showHint(false);
+      }, { passive: true });
+    })();
+    </script>
+    """,
+    height=0,
+    width=0,
+)
+
 # 交易時段每分鐘更新；其餘時段每 30 分鐘更新。
 _refresh_sec = 60 if _is_market_open_now() else 1800
 st_autorefresh(interval=_refresh_sec * 1000, limit=None, key="long_underwater_dynamic_refresh")

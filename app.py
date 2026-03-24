@@ -5,7 +5,11 @@
 """
 from __future__ import annotations
 
+import re
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, time
 from pathlib import Path
 
 import pandas as pd
@@ -37,8 +41,64 @@ def _cached_wtx_night_price():
     return fetch_wtx_quote_price()
 
 
-@st.cache_data(show_spinner="下載週線與日線…", ttl=60)
-def load_market_data(ticker: str, start_date: str):
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_bottom_strategy_summary(_refresh_key: str) -> tuple[dict | None, str | None]:
+    """固定指令執行 bottom_strategy，回傳摘要與錯誤訊息。"""
+    script_dir = _ROOT / "tw_index_futur"
+    cmd = [
+        sys.executable,
+        "bottom_strategy.py",
+        "--target",
+        "twi",
+        "--alert-score",
+        "6",
+        "--watch-score",
+        "4",
+    ]
+    try:
+        cp = subprocess.run(
+            cmd,
+            cwd=str(script_dir),
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except Exception as e:
+        return None, str(e)
+
+    out = (cp.stdout or "").strip()
+    if cp.returncode != 0:
+        err = (cp.stderr or "").strip()
+        return None, f"exit={cp.returncode}; {err[:200] if err else '執行失敗'}"
+    if not out:
+        return None, "無輸出"
+
+    def pick(pat: str) -> str | None:
+        m = re.search(pat, out, flags=re.MULTILINE)
+        return m.group(1).strip() if m else None
+
+    summary = {
+        "target": pick(r"^target:\s*(.+)$"),
+        "date": pick(r"^date:\s*(.+)$"),
+        "level": pick(r"^signal_level:\s*(.+)$"),
+        "score": pick(r"^score:\s*(.+)$"),
+        "hits": None,
+        "snapshot": None,
+    }
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("條件命中:"):
+            summary["hits"] = line.replace("條件命中:", "", 1).strip()
+        elif line.startswith("快照數值:"):
+            summary["snapshot"] = line.replace("快照數值:", "", 1).strip()
+    return summary, None
+
+
+@st.cache_data(show_spinner="下載週線與日線…")
+def load_market_data(ticker: str, start_date: str, _refresh_key: str):
     """依代號與起始日抓取週線狀態機 + 日線（含週結束日）；快取 60 秒與頁面每分鐘自動 rerun 對齊。"""
     df_w = fetch_weekly_stock_data(ticker, start_date=start_date)
     stats = calculate_long_position_stats(df_w)
@@ -47,24 +107,388 @@ def load_market_data(ticker: str, start_date: str):
     return df_w, stats, daily_we
 
 
+def _is_market_open_now() -> bool:
+    """台股一般盤時段：09:00~13:45（本機時間）。"""
+    now_t = datetime.now().time()
+    return time(9, 0) <= now_t <= time(13, 45)
+
+
+def _market_refresh_key() -> str:
+    """
+    做多段資料刷新鍵：
+    - 09:00~13:45：每分鐘換 key
+    - 其他時段：每 30 分鐘換 key
+    """
+    now = datetime.now()
+    if _is_market_open_now():
+        return now.strftime("mkt-%Y%m%d-%H%M")
+    slot = (now.minute // 30) * 30
+    return now.replace(minute=slot, second=0, microsecond=0).strftime("mkt-%Y%m%d-%H%M")
+
+
+def _bottom_refresh_key() -> str:
+    """底部策略固定每 30 分鐘換 key。"""
+    now = datetime.now()
+    slot = (now.minute // 30) * 30
+    return now.replace(minute=slot, second=0, microsecond=0).strftime("btm-%Y%m%d-%H%M")
+
+
+def _is_after_1500() -> bool:
+    return datetime.now().time() >= time(15, 0)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | None, str | None]:
+    """
+    讀取底部策略同源資料的「最新日期」快照（允許部分欄位缺值）。
+    用於 15:00 後先顯示最新日，缺欄位標示尚未更新。
+    """
+    try:
+        import bottom_strategy as bs_mod
+
+        stock_id = bs_mod.resolve_stock_id("twi", "加權指數")
+        urls = bs_mod.build_urls(stock_id)
+        sess = bs_mod.requests.Session()
+        html_k = bs_mod.fetch_goodinfo_html(sess, urls["k"], timeout=30)
+        html_b = bs_mod.fetch_goodinfo_html(sess, urls["buy"], timeout=30)
+        html_m = bs_mod.fetch_goodinfo_html(sess, urls["margin"], timeout=30)
+        k_df = bs_mod.select_main_table(html_k)
+        b_df = bs_mod.select_main_table(html_b)
+        m_df = bs_mod.select_main_table(html_m)
+        feat = bs_mod.build_feature_frame(k_df, b_df, m_df)
+        if feat is None or len(feat) == 0:
+            return None, "無最新快照資料"
+        row = feat.sort_values("date").iloc[-1]
+
+        def _fmt(v: float | int | None, suffix: str = "") -> str:
+            if v is None or pd.isna(v):
+                return "尚未更新"
+            return f"{float(v):.2f}{suffix}"
+
+        return {
+            "date": pd.Timestamp(row["date"]).strftime("%Y-%m-%d") if pd.notna(row["date"]) else None,
+            "snapshot_map": {
+                "漲跌幅": _fmt(row.get("chg_pct"), "%"),
+                "振幅": _fmt(row.get("amp_pct"), "%"),
+                "成交量": _fmt(row.get("volume_b"), "億元"),
+                "三大法人買賣超": _fmt(row.get("inst_net_100m"), "億元"),
+                "融資增減": _fmt(row.get("mgn_chg_100m"), "億元"),
+                "融券增減率": _fmt(row.get("short_chg_pct"), "%"),
+            },
+        }, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _render_bottom_strategy_panel(
+    bs: dict | None,
+    bs_err: str | None,
+    partial_latest: dict | None = None,
+) -> None:
+    if bs_err:
+        st.caption(f"底部策略：讀取失敗（{bs_err}）")
+        return
+    if not bs:
+        return
+
+    bs_date = pd.to_datetime(bs.get("date"), errors="coerce")
+    partial_date = pd.to_datetime((partial_latest or {}).get("date"), errors="coerce")
+    use_partial = bool(
+        _is_after_1500()
+        and partial_latest
+        and pd.notna(partial_date)
+        and (pd.isna(bs_date) or partial_date > bs_date)
+    )
+
+    score_text = bs.get("score") or "-"
+    panel_date = bs.get("date") or "-"
+    if use_partial:
+        panel_date = partial_latest.get("date") or panel_date
+        score_text = "尚未更新"
+
+    st.info(
+        "底部策略 | "
+        f"日期 {panel_date} | "
+        f"分數 {score_text}"
+    )
+    if use_partial and partial_latest:
+        snap_map = partial_latest.get("snapshot_map", {})
+        card_defs = [
+            ("漲跌幅", "大跌"),
+            ("振幅", "高振幅"),
+            ("成交量", "高成交量"),
+            ("三大法人買賣超", "法人偏空"),
+            ("融資增減", "融資減少"),
+            ("融券增減率", "融券減少"),
+        ]
+        cards = []
+        for metric_name, _ in card_defs:
+            val = str(snap_map.get(metric_name, "尚未更新"))
+            is_ready = (val != "尚未更新")
+            status = "已更新" if is_ready else "尚未更新"
+            css_cls = "hit" if is_ready else "pending"
+            cards.append(
+                f'<div class="bs-card {css_cls}">'
+                f'<div class="bs-title">{metric_name}｜{status}</div>'
+                f'<div class="bs-value">{val}</div>'
+                "</div>"
+            )
+        st.markdown('<div class="bs-grid">' + "".join(cards) + "</div>", unsafe_allow_html=True)
+        return
+
+    if bs.get("hits") and bs.get("snapshot"):
+        hit_map: dict[str, bool] = {}
+        for part in str(bs["hits"]).split(","):
+            if "=" not in part:
+                continue
+            k, v = [x.strip() for x in part.split("=", 1)]
+            hit_map[k] = (v == "是")
+
+        snap_map: dict[str, str] = {}
+        for part in str(bs["snapshot"]).split(","):
+            if "=" not in part:
+                continue
+            k, v = [x.strip() for x in part.split("=", 1)]
+            snap_map[k] = v
+
+        card_defs = [
+            ("漲跌幅", "大跌"),
+            ("振幅", "高振幅"),
+            ("成交量", "高成交量"),
+            ("三大法人買賣超", "法人偏空"),
+            ("融資增減", "融資減少"),
+            ("融券增減率", "融券減少"),
+        ]
+        cards = []
+        for metric_name, hit_key in card_defs:
+            val = snap_map.get(metric_name, "-")
+            is_hit = bool(hit_map.get(hit_key, False))
+            status = "達標" if is_hit else "未達"
+            cards.append(
+                f'<div class="bs-card {"hit" if is_hit else "miss"}">'
+                f'<div class="bs-title">{metric_name}｜{status}</div>'
+                f'<div class="bs-value">{val}</div>'
+                "</div>"
+            )
+        st.markdown('<div class="bs-grid">' + "".join(cards) + "</div>", unsafe_allow_html=True)
+    else:
+        if bs.get("hits"):
+            st.caption(f"條件命中：{bs['hits']}")
+        if bs.get("snapshot"):
+            st.caption(f"快照數值：{bs['snapshot']}")
+
+
 st.set_page_config(page_title="做多段日線鑽取", layout="wide")
-# 每 60 秒觸發整頁 rerun，搭配 load_market_data(ttl=60) 重新抓行情
-st_autorefresh(interval=60 * 1000, limit=None, key="long_underwater_minute_refresh")
-st.title("做多段：週線區間 OHLC + 日線鑽取")
-st.caption("週界：週四～下週三（與 fetch_daily_stock_data_W 一致）｜進場價＝第一週收盤｜跌破判定從進場收盤後開始")
+# 行動裝置優化：縮小字級與留白，讓單手滑動閱讀更順。
+st.markdown(
+    """
+    <style>
+    .kpi-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin: 0.2rem 0 0.5rem 0;
+      max-width: 760px;
+      width: 96%;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .kpi-col {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .kpi-col.right {
+      text-align: right;
+    }
+    .kpi-label {
+      color: #111827;
+      font-size: 0.96rem;
+      line-height: 1.25;
+      margin-bottom: 0.15rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .kpi-value {
+      color: #111827;
+      font-size: 1.5rem;
+      line-height: 1.25;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .section-label {
+      font-size: 1.05rem;
+      font-weight: 600;
+      line-height: 1.35;
+      margin: 0;
+      padding: 0;
+    }
+    .bs-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.45rem;
+      margin: 0.25rem 0 0.35rem 0;
+    }
+    .bs-card {
+      border-radius: 0.5rem;
+      border: 1px solid #d1d5db;
+      padding: 0.5rem 0.55rem;
+      line-height: 1.25;
+    }
+    .bs-card.hit {
+      background: #ecfdf5;
+      border-color: #10b981;
+    }
+    .bs-card.miss {
+      background: #f3f4f6;
+      border-color: #d1d5db;
+    }
+    .bs-card.pending {
+      background: #fffbeb;
+      border-color: #f59e0b;
+    }
+    .bs-title {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #374151;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bs-value {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: #111827;
+      margin-top: 0.12rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    /* 自動刷新元件容器不需要可視空間，將留白壓到最小 */
+    .st-key-long_underwater_dynamic_refresh {
+      margin: 0 !important;
+      padding: 0 !important;
+      min-height: 0 !important;
+    }
+    .st-key-long_underwater_dynamic_refresh > div {
+      margin: 0 !important;
+      padding: 0 !important;
+      min-height: 0 !important;
+    }
+    /* 隱藏右上角 Deploy 按鈕 */
+    [data-testid="stAppDeployButton"] {
+      display: none !important;
+    }
+    @media (max-width: 768px) {
+      .block-container {
+        padding-top: 0.8rem !important;
+        padding-left: 0.8rem !important;
+        padding-right: 0.8rem !important;
+        padding-bottom: 1rem !important;
+      }
+      h1 {
+        font-size: 1.35rem !important;
+        line-height: 1.35 !important;
+        margin-bottom: 0.35rem !important;
+      }
+      h2, h3 {
+        font-size: 1.05rem !important;
+        line-height: 1.35 !important;
+        margin-top: 0.75rem !important;
+        margin-bottom: 0.35rem !important;
+      }
+      p, label, .stCaption, .stMarkdown, .stAlert {
+        font-size: 0.92rem !important;
+      }
+      .stSelectbox label, .stTextInput label {
+        font-size: 0.85rem !important;
+      }
+      .kpi-row {
+        gap: 0.55rem;
+        width: 98%;
+      }
+      .kpi-label {
+        font-size: 1.2rem;
+      }
+      .kpi-value {
+        font-size: 1.5rem;
+      }
+      .section-label {
+        font-size: 1rem;
+      }
+      .bs-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .bs-title {
+        font-size: 0.74rem;
+      }
+      .bs-value {
+        font-size: 0.82rem;
+      }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+# 交易時段每分鐘更新；其餘時段每 30 分鐘更新。
+_refresh_sec = 60 if _is_market_open_now() else 1800
+st_autorefresh(interval=_refresh_sec * 1000, limit=None, key="long_underwater_dynamic_refresh")
 
 with st.sidebar:
     ticker = st.text_input("股票代號", value="^TWII")
     start_date = st.text_input("資料起始日", value="2020-01-01")
-    st.caption("每分鐘自動重新整理並更新資料；同一代號／日期 60 秒內重複載入使用快取。")
+    st.caption("做多段：09:00~13:45 每分鐘更新，其餘時段每 30 分鐘更新；底部策略固定每 30 分鐘更新。")
 
 _t = ticker.strip()
 _sd = start_date.strip()
-try:
-    df_w, stats, daily_we = load_market_data(_t, _sd)
-except Exception as e:
-    st.error(f"資料載入失敗：{e}")
+bs_slot = st.empty()
+load_slot = st.empty()
+
+_bs: dict | None = None
+_bs_err: str | None = None
+_bs_partial: dict | None = None
+_bs_partial_err: str | None = None
+df_w = stats = daily_we = None
+market_err: Exception | None = None
+
+with ThreadPoolExecutor(max_workers=2) as executor:
+    futures = {
+        executor.submit(_cached_bottom_strategy_summary, _bottom_refresh_key()): "bs",
+        executor.submit(load_market_data, _t, _sd, _market_refresh_key()): "market",
+    }
+    if _is_after_1500():
+        futures[executor.submit(_cached_bottom_strategy_partial_latest, _bottom_refresh_key())] = "bs_partial"
+    for future in as_completed(futures):
+        kind = futures[future]
+        if kind == "bs":
+            try:
+                _bs, _bs_err = future.result()
+            except Exception as e:
+                _bs, _bs_err = None, str(e)
+            with bs_slot.container():
+                _render_bottom_strategy_panel(_bs, _bs_err, _bs_partial)
+        elif kind == "bs_partial":
+            try:
+                _bs_partial, _bs_partial_err = future.result()
+            except Exception as e:
+                _bs_partial, _bs_partial_err = None, str(e)
+            # partial 失敗不阻斷：僅回落完整訊號顯示
+            with bs_slot.container():
+                _render_bottom_strategy_panel(_bs, _bs_err, _bs_partial)
+        else:
+            try:
+                df_w, stats, daily_we = future.result()
+                load_slot.caption("做多段資料已載入")
+            except Exception as e:
+                market_err = e
+                load_slot.error(f"資料載入失敗：{e}")
+
+if market_err is not None:
     st.stop()
+load_slot.empty()
+
+
+st.caption("週界：週四~下週三｜進場=首週收盤")
 
 if stats is None or len(stats) == 0:
     st.warning("沒有做多段統計資料。")
@@ -174,14 +598,28 @@ if len(seg_weekly) > 0 and {"每週做多煞車價位", "週對應出場價"}.is
                 f"做多煞車警戒：本週已連跌破 **{close_below_brake_count}** 根。"
             )
 
-c1, c2 = st.columns(2)
-c1.metric("進場價（第一週收盤）", f"{entry_price:,.2f}")
-if res["first_intraday_break"]:
-    c2.metric("本段首次盤中跌破日", res["first_intraday_break"]["日期"].strftime("%Y-%m-%d"))
-else:
-    c2.metric("本段首次盤中跌破日", "無")
+first_break_text = (
+    res["first_intraday_break"]["日期"].strftime("%Y-%m-%d")
+    if res["first_intraday_break"]
+    else "無"
+)
+st.markdown(
+    f"""
+    <div class="kpi-row">
+      <div class="kpi-col">
+        <div class="kpi-label">進場價</div>
+        <div class="kpi-value">{entry_price:,.2f}</div>
+      </div>
+      <div class="kpi-col right">
+        <div class="kpi-label">首次盤中跌破</div>
+        <div class="kpi-value">{first_break_text}</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.subheader("日線 K 線（含進場/出場價線、煞車與跌破標記、20日均線）")
+st.markdown('<div class="section-label">日線 K 線</div>', unsafe_allow_html=True)
 if len(seg_daily_chart) == 0:
     st.warning("此段無日線資料。")
 else:
@@ -234,7 +672,7 @@ else:
         y=alert_line,
         line_dash="dash",
         line_color="#ca8a04",
-        annotation_text=f"警戒線 進場×0.98 {alert_line:,.2f}",
+        annotation_text=f"警戒線 {alert_line:,.2f}",
     )
     # 每週出場價格梯線（上週出場價格）— 與煞車價位分開顯示
     weekly_exit_line = seg_weekly[["日期", "週對應出場價"]].copy()
@@ -245,7 +683,7 @@ else:
                 x=weekly_exit_line["日期"],
                 y=weekly_exit_line["週對應出場價"],
                 mode="lines+markers",
-                name="每週出場價格梯線",
+                name="出場梯線",
                 line=dict(color="#2563eb", width=2, dash="dot"),
                 line_shape="hv",
                 marker=dict(size=7, color="#2563eb", symbol="square"),
@@ -265,7 +703,7 @@ else:
                 x=weekly_brake_line["日期"],
                 y=weekly_brake_line["每週做多煞車價位"],
                 mode="lines+markers",
-                name="每週做多煞車價位",
+                name="煞車價位",
                 line=dict(color="#dc2626", width=2, dash="dash"),
                 line_shape="hv",
                 marker=dict(size=7, color="#dc2626"),
@@ -309,7 +747,7 @@ else:
                 x=[brake_close_day],
                 y=[brake_close_price],
                 mode="markers+text",
-                name="做多煞車(T)",
+                name="煞車T",
                 marker=dict(size=12, color="#f59e0b"),
                 text=["煞車"],
                 textposition="top center",
@@ -330,7 +768,7 @@ else:
                 x=seg_daily_chart["日期"],
                 y=seg_daily_chart["20日均線"],
                 mode="lines",
-                name="20日均線",
+                name="MA20",
                 line=dict(color="#7c3aed", width=2),
             )
         )
@@ -341,7 +779,7 @@ else:
                 x=[fb["日期"]],
                 y=[fb["最低價"]],
                 mode="markers+text",
-                name="首次盤中跌破",
+                name="跌破",
                 marker=dict(size=12, color="red"),
                 text=["跌破"],
                 textposition="top center",
@@ -349,11 +787,21 @@ else:
         )
 
     fig.update_layout(
-        height=520,
-        xaxis_title="日期",
-        yaxis_title="價格",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        margin=dict(l=40, r=40, t=40, b=40),
+        # 手機螢幕較短，預設用較緊湊高度；桌機仍可用容器寬度展開。
+        height=420,
+        xaxis_title=None,
+        yaxis_title=None,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            font=dict(size=11),
+            entrywidthmode="pixels",
+            entrywidth=72,
+        ),
+        margin=dict(l=8, r=8, t=30, b=8),
         xaxis_rangeslider_visible=False,
         # 關閉時間軸／價格軸拖曳與縮放（無下方滑軌、無框選縮放）
         xaxis=dict(fixedrange=True),

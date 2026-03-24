@@ -330,6 +330,7 @@ else:
                 textposition="top center",
             )
         )
+
     fig.update_layout(
         height=520,
         xaxis_title="日期",
@@ -337,8 +338,16 @@ else:
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         margin=dict(l=40, r=40, t=40, b=40),
         xaxis_rangeslider_visible=False,
+        # 關閉時間軸／價格軸拖曳與縮放（無下方滑軌、無框選縮放）
+        xaxis=dict(fixedrange=True),
+        yaxis=dict(fixedrange=True),
+        dragmode=False,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"scrollZoom": False, "doubleClick": False},
+    )
 
 st.subheader("週線表（區間 OHLC）")
 display_cols = ["日期", "開盤價", "最高價", "最低價", "收盤價"]

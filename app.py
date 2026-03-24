@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import numpy as np
+from streamlit_autorefresh import st_autorefresh
 
 # 確保可 import tw_index_futur
 _ROOT = Path(__file__).resolve().parent.parent
@@ -36,9 +37,9 @@ def _cached_wtx_night_price():
     return fetch_wtx_quote_price()
 
 
-@st.cache_data(show_spinner="下載週線與日線…", ttl=600)
+@st.cache_data(show_spinner="下載週線與日線…", ttl=60)
 def load_market_data(ticker: str, start_date: str):
-    """依代號與起始日抓取週線狀態機 + 日線（含週結束日）；結果快取避免重複請求。"""
+    """依代號與起始日抓取週線狀態機 + 日線（含週結束日）；快取 60 秒與頁面每分鐘自動 rerun 對齊。"""
     df_w = fetch_weekly_stock_data(ticker, start_date=start_date)
     stats = calculate_long_position_stats(df_w)
     df_d = fetch_daily_chinese(ticker, start_date=start_date)
@@ -47,13 +48,15 @@ def load_market_data(ticker: str, start_date: str):
 
 
 st.set_page_config(page_title="做多段日線鑽取", layout="wide")
+# 每 60 秒觸發整頁 rerun，搭配 load_market_data(ttl=60) 重新抓行情
+st_autorefresh(interval=60 * 1000, limit=None, key="long_underwater_minute_refresh")
 st.title("做多段：週線區間 OHLC + 日線鑽取")
 st.caption("週界：週四～下週三（與 fetch_daily_stock_data_W 一致）｜進場價＝第一週收盤｜跌破判定從進場收盤後開始")
 
 with st.sidebar:
     ticker = st.text_input("股票代號", value="^TWII")
     start_date = st.text_input("資料起始日", value="2020-01-01")
-    st.caption("開啟或變更代號／日期後會自動載入（約 10 分鐘內重複瀏覽使用快取）。")
+    st.caption("每分鐘自動重新整理並更新資料；同一代號／日期 60 秒內重複載入使用快取。")
 
 _t = ticker.strip()
 _sd = start_date.strip()
@@ -104,8 +107,22 @@ if choice == _last_idx and _latest_state == "做多中":
 
 # 進行中：統計表的「退出日期」是前一週（避免未收盤失真），圖表仍要延伸到資料最新一週（含進行中週）
 latest_week_end = pd.Timestamp(pd.to_datetime(df_w["日期"]).max()).normalize()
-is_ongoing = "狀態" in row.index and str(row.get("狀態", "")).strip() == "進行中"
-display_week_end = latest_week_end if is_ongoing else None
+# 統計列「進行中」或（選最後一段且週線最新列仍為做多中）都視為進行中，圖表需延伸到日線最後一週
+is_ongoing = (
+    ("狀態" in row.index and str(row.get("狀態", "")).strip() == "進行中")
+    or (choice == _last_idx and _latest_state == "做多中")
+)
+# 日線可能比週線表多一週（yfinance 已更新、週線最後列仍停在上週三）：segment_slice 以「週結束日」篩選，
+# 若 slice_upper 只跟週線走會整週被切掉（例如少 2026-03-23 這類尚未收週的交易日）。
+if is_ongoing:
+    _dwe_max = pd.to_datetime(daily_we["週結束日"], errors="coerce").max()
+    if pd.notna(_dwe_max):
+        _dwe_max = pd.Timestamp(_dwe_max).normalize()
+        display_week_end = max(latest_week_end, _dwe_max)
+    else:
+        display_week_end = latest_week_end
+else:
+    display_week_end = None
 
 res = segment_slice(
     daily_we, df_w, entry_date, exit_date, entry_price, display_week_end=display_week_end

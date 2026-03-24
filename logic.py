@@ -50,6 +50,41 @@ def fetch_daily_chinese(ticker: str, start_date: str = "2020-01-01") -> pd.DataF
     )
     df_daily["日期"] = _strip_tz(df_daily["日期"])
     df_daily = df_daily.drop_duplicates(subset=["日期"], keep="last").sort_values("日期").reset_index(drop=True)
+    # ^TWII 最後一根日 K 改用 Yahoo 台股頁面即時值，避免 yfinance 最末筆延遲或缺漏。
+    if ticker.strip().upper() == "^TWII":
+        try:
+            from yahoo_tw_twii_price import fetch_twii_quote_ohlc
+
+            twii_ohlc, twii_err = fetch_twii_quote_ohlc()
+            if twii_ohlc and twii_err is None:
+                q_date = pd.Timestamp(twii_ohlc["日期"]).normalize()
+                q_open = float(twii_ohlc["開盤價"])
+                q_high = float(twii_ohlc["最高價"])
+                q_low = float(twii_ohlc["最低價"])
+                q_close = float(twii_ohlc["收盤價"])
+                if len(df_daily) > 0 and pd.Timestamp(df_daily.iloc[-1]["日期"]).normalize() == q_date:
+                    df_daily.loc[df_daily.index[-1], ["開盤價", "最高價", "最低價", "收盤價"]] = [
+                        q_open,
+                        q_high,
+                        q_low,
+                        q_close,
+                    ]
+                elif len(df_daily) == 0 or q_date > pd.Timestamp(df_daily.iloc[-1]["日期"]).normalize():
+                    add = pd.DataFrame(
+                        [
+                            {
+                                "日期": q_date,
+                                "開盤價": q_open,
+                                "最高價": q_high,
+                                "最低價": q_low,
+                                "收盤價": q_close,
+                            }
+                        ]
+                    )
+                    df_daily = pd.concat([df_daily, add], ignore_index=True)
+        except Exception:
+            # 即時來源失敗時回退 yfinance，避免中斷主流程。
+            pass
     return df_daily
 
 
@@ -88,11 +123,13 @@ def assign_week_id_to_daily(df_daily: pd.DataFrame) -> pd.DataFrame:
 def build_daily_with_week_end(df_daily: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     日線附上 週結束日（週三）；並回傳對應周線表（含 周標識）。
+
+    週結束日必須與 convert_to_weekly_data 內「周標識→週三」對照一致；若只用週線表 merge，
+    在週線 drop_duplicates(日期) 後會丟失部分周標識，尾端交易日 週結束日 變成 NaN，日 K 會少最近幾根。
     """
-    df = assign_week_id_to_daily(df_daily)
-    weekly = convert_to_weekly_data(df_daily)
-    wmap = weekly[["周標識", "日期"]].rename(columns={"日期": "週結束日"})
-    out = df.merge(wmap, on="周標識", how="left")
+    weekly, df_tagged, wmap = convert_to_weekly_data(df_daily, return_tagged_daily=True)
+    out = df_tagged.merge(wmap, on="周標識", how="left")
+    out["週結束日"] = pd.to_datetime(out["週結束日"])
     # 日Ｋ 20 日均線（依整段日線計算；之後切區間才不會被「起手不足 20 天」影響）
     out = out.sort_values("日期").reset_index(drop=True)
     out["20日均線"] = out["收盤價"].rolling(window=20, min_periods=20).mean().round(2)

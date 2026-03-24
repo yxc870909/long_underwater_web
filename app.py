@@ -138,6 +138,94 @@ def _is_after_1500() -> bool:
     return datetime.now().time() >= time(15, 0)
 
 
+def _enable_pull_to_refresh() -> None:
+    """手機端下拉刷新：在頁面頂部向下拉超過門檻時，觸發 reload。"""
+    components.html(
+        """
+        <div id="ptr-indicator">下拉可刷新</div>
+        <script>
+        (function () {
+          if (window.__streamlitPullToRefreshBound) return;
+          window.__streamlitPullToRefreshBound = true;
+
+          const THRESHOLD = 95;
+          let startY = 0;
+          let pulling = false;
+          let fired = false;
+          const indicator = document.getElementById("ptr-indicator");
+
+          function getScrollTop() {
+            const root = document.scrollingElement || document.documentElement || document.body;
+            return root ? root.scrollTop : 0;
+          }
+
+          function setHint(text, visible) {
+            if (!indicator) return;
+            indicator.textContent = text;
+            indicator.style.opacity = visible ? "1" : "0";
+          }
+
+          window.addEventListener("touchstart", function (e) {
+            if (!e.touches || e.touches.length !== 1) return;
+            if (getScrollTop() > 0) return;
+            startY = e.touches[0].clientY;
+            pulling = true;
+            fired = false;
+          }, { passive: true });
+
+          window.addEventListener("touchmove", function (e) {
+            if (!pulling || fired || !e.touches || e.touches.length !== 1) return;
+            const deltaY = e.touches[0].clientY - startY;
+            if (deltaY <= 0) {
+              setHint("下拉可刷新", false);
+              return;
+            }
+            if (getScrollTop() > 0) {
+              pulling = false;
+              setHint("下拉可刷新", false);
+              return;
+            }
+            if (deltaY > THRESHOLD) {
+              setHint("刷新中...", true);
+              fired = true;
+              window.location.reload();
+            } else {
+              setHint("繼續下拉以刷新", true);
+            }
+          }, { passive: true });
+
+          window.addEventListener("touchend", function () {
+            pulling = false;
+            fired = false;
+            setHint("下拉可刷新", false);
+          }, { passive: true });
+
+          setHint("下拉可刷新", false);
+        })();
+        </script>
+        <style>
+          #ptr-indicator {
+            position: fixed;
+            top: 8px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 99999;
+            background: rgba(17, 24, 39, 0.82);
+            color: #fff;
+            font-size: 12px;
+            line-height: 1;
+            padding: 7px 10px;
+            border-radius: 999px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.18s ease;
+          }
+        </style>
+        """,
+        height=0,
+    )
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | None, str | None]:
     """
@@ -280,6 +368,7 @@ def _render_bottom_strategy_panel(
 
 
 st.set_page_config(page_title="做多段日線鑽取", layout="wide")
+_enable_pull_to_refresh()
 # 行動裝置優化：縮小字級與留白，讓單手滑動閱讀更順。
 st.markdown(
     """
@@ -434,74 +523,6 @@ st.markdown(
 # 交易時段每分鐘更新；其餘時段每 30 分鐘更新。
 _refresh_sec = 60 if _is_market_open_now() else 1800
 st_autorefresh(interval=_refresh_sec * 1000, limit=None, key="long_underwater_dynamic_refresh")
-components.html(
-    """
-    <script>
-    (() => {
-      const PARENT = window.parent;
-      if (!PARENT || PARENT.__longUnderwaterPullRefreshInit) return;
-      PARENT.__longUnderwaterPullRefreshInit = true;
-
-      let startY = 0;
-      let pulling = false;
-      let reloading = false;
-      const THRESHOLD = 95;
-
-      function showHint(text) {
-        if (!PARENT.document || !PARENT.document.body) return;
-        const id = "long-underwater-pull-refresh-hint";
-        let el = PARENT.document.getElementById(id);
-        if (!el) {
-          el = PARENT.document.createElement("div");
-          el.id = id;
-          el.style.position = "fixed";
-          el.style.top = "12px";
-          el.style.left = "50%";
-          el.style.transform = "translateX(-50%)";
-          el.style.padding = "6px 10px";
-          el.style.borderRadius = "999px";
-          el.style.background = "rgba(17,24,39,0.88)";
-          el.style.color = "#fff";
-          el.style.fontSize = "12px";
-          el.style.zIndex = "99999";
-          el.style.pointerEvents = "none";
-          el.style.opacity = "0";
-          el.style.transition = "opacity .2s ease";
-          PARENT.document.body.appendChild(el);
-        }
-        el.textContent = text;
-        el.style.opacity = "1";
-        setTimeout(() => { el.style.opacity = "0"; }, 800);
-      }
-
-      PARENT.addEventListener("touchstart", (e) => {
-        if ((PARENT.scrollY || 0) > 0 || reloading) {
-          pulling = false;
-          return;
-        }
-        startY = e.touches?.[0]?.clientY ?? 0;
-        pulling = true;
-      }, { passive: true });
-
-      PARENT.addEventListener("touchmove", (e) => {
-        if (!pulling || reloading) return;
-        const currentY = e.touches?.[0]?.clientY ?? startY;
-        const dy = currentY - startY;
-        if (dy > THRESHOLD && (PARENT.scrollY || 0) <= 0) {
-          reloading = true;
-          showHint("重新整理中…");
-          setTimeout(() => { PARENT.location.reload(); }, 120);
-        }
-      }, { passive: true });
-
-      PARENT.addEventListener("touchend", () => {
-        pulling = false;
-      }, { passive: true });
-    })();
-    </script>
-    """,
-    height=0,
-)
 
 with st.sidebar:
     ticker = st.text_input("股票代號", value="^TWII")

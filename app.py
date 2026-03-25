@@ -260,8 +260,7 @@ def _render_bottom_strategy_panel(
     bs_date = pd.to_datetime(bs.get("date"), errors="coerce")
     partial_date = pd.to_datetime((partial_latest or {}).get("date"), errors="coerce")
     use_partial = bool(
-        _is_after_1500()
-        and partial_latest
+        partial_latest
         and pd.notna(partial_date)
         and (pd.isna(bs_date) or partial_date > bs_date)
     )
@@ -604,8 +603,8 @@ with ThreadPoolExecutor(max_workers=2) as executor:
         executor.submit(_cached_bottom_strategy_summary, _bottom_refresh_key()): "bs",
         executor.submit(load_market_data, _t, _sd, _market_refresh_key()): "market",
     }
-    if _is_after_1500():
-        futures[executor.submit(_cached_bottom_strategy_partial_latest, _bottom_refresh_key())] = "bs_partial"
+    # 不分時段都允許使用 partial_latest（若日期更新較新則優先顯示）
+    futures[executor.submit(_cached_bottom_strategy_partial_latest, _bottom_refresh_key())] = "bs_partial"
     for future in as_completed(futures):
         kind = futures[future]
         if kind == "bs":

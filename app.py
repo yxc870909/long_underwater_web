@@ -112,24 +112,12 @@ def _cached_bottom_strategy_summary(_refresh_key: str) -> tuple[dict | None, str
 
 @st.cache_data(show_spinner="下載週線與日線…")
 def load_market_data(ticker: str, start_date: str, _refresh_key: str):
-    """依代號與起始日抓取週線狀態機 + 日線（含週結束日）；以 _refresh_key 每分鐘失效快取。"""
+    """依代號與起始日抓取週線狀態機 + 日線（含週結束日）；以 _refresh_key 失效快取。"""
     df_w = fetch_weekly_stock_data(ticker, start_date=start_date)
     stats = calculate_long_position_stats(df_w)
     df_d = fetch_daily_chinese(ticker, start_date=start_date)
     daily_we, _ = build_daily_with_week_end(df_d)
     return df_w, stats, daily_we
-
-
-def _market_refresh_key() -> str:
-    """做多段資料刷新鍵：全天每分鐘一個 key，與 st_autorefresh 對齊。"""
-    return datetime.now().strftime("mkt-%Y%m%d-%H%M")
-
-
-def _bottom_refresh_key() -> str:
-    """底部策略固定每 30 分鐘換 key。"""
-    now = datetime.now()
-    slot = (now.minute // 30) * 30
-    return now.replace(minute=slot, second=0, microsecond=0).strftime("btm-%Y%m%d-%H%M")
 
 
 def _calc_week_end_from_trade_date(trade_date: pd.Timestamp) -> pd.Timestamp:
@@ -199,15 +187,11 @@ def _apply_live_last_candle(seg_daily_chart: pd.DataFrame, ticker: str) -> pd.Da
         return seg_daily_chart
 
 
-def _is_after_1500() -> bool:
-    return datetime.now().time() >= time(15, 0)
-
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | None, str | None]:
     """
     讀取底部策略同源資料的「最新日期」快照（允許部分欄位缺值）。
-    用於 15:00 後先顯示最新日，缺欄位標示尚未更新。
+    欄位缺值時，會顯示為「尚未更新」。
     """
     try:
         import bottom_strategy as bs_mod
@@ -577,14 +561,11 @@ components.html(
     width=0,
 )
 
-# 做多段：全天每分鐘自動 rerun（底部策略仍依自身 refresh key，每 30 分鐘才換快取）。
-st_autorefresh(interval=60_000, limit=None, key="long_underwater_dynamic_refresh")
-
 with st.sidebar:
     st.markdown("#### 設定")
     ticker = st.text_input("股票代號", value="^TWII")
     start_date = st.text_input("資料起始日", value="2020-01-01")
-    st.caption("做多段：全天每分鐘更新；底部策略固定每 30 分鐘更新。")
+    st.caption("做多段：每次重新整理（含下拉刷新）都會重抓；不再每分鐘自動更新。")
 
 _t = ticker.strip()
 _sd = start_date.strip()
@@ -599,12 +580,13 @@ df_w = stats = daily_we = None
 market_err: Exception | None = None
 
 with ThreadPoolExecutor(max_workers=2) as executor:
+    # 每次整頁 rerun 都用不同的 key，確保 st.cache_data 不會直接回傳舊資料。
+    refresh_nonce = datetime.now().strftime("run-%Y%m%d-%H%M%S-%f")
     futures = {
-        executor.submit(_cached_bottom_strategy_summary, _bottom_refresh_key()): "bs",
-        executor.submit(load_market_data, _t, _sd, _market_refresh_key()): "market",
+        executor.submit(_cached_bottom_strategy_summary, refresh_nonce): "bs",
+        executor.submit(load_market_data, _t, _sd, refresh_nonce): "market",
+        executor.submit(_cached_bottom_strategy_partial_latest, refresh_nonce): "bs_partial",
     }
-    # 不分時段都允許使用 partial_latest（若日期更新較新則優先顯示）
-    futures[executor.submit(_cached_bottom_strategy_partial_latest, _bottom_refresh_key())] = "bs_partial"
     for future in as_completed(futures):
         kind = futures[future]
         if kind == "bs":

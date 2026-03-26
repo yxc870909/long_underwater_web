@@ -9,18 +9,34 @@
 
 ## 環境
 
+**Monorepo（`Stk_Ops` 內含 `long_underwater_web` 與上層 `tw_index_futur`）**
+
 ```bash
 cd /path/to/Stk_Ops
 pip install -r long_underwater_web/requirements.txt
 ```
 
-（需能 import `tw_index_futur/fetch_daily_stock_data_W.py`，請在 **Stk_Ops 根目錄** 的上層結構保持不變。）
+**獨立 clone（本 repo 根目錄已含 `tw_index_futur`）**
+
+```bash
+cd /path/to/long_underwater_web
+pip install -r requirements.txt
+```
 
 ## 啟動（localhost）
+
+**Monorepo**
 
 ```bash
 cd /path/to/Stk_Ops
 streamlit run long_underwater_web/app.py
+```
+
+**獨立 clone**
+
+```bash
+cd /path/to/long_underwater_web
+streamlit run app.py
 ```
 
 瀏覽器開啟後會**自動載入**側欄代號與起始日（預設 `^TWII`）；做多段下拉選單預設為**最後一筆**。變更代號或日期後會重新抓取（約 10 分鐘內有快取）。
@@ -30,7 +46,10 @@ streamlit run long_underwater_web/app.py
 ## 第二週「收不回進場價」與盤中最深跌幅統計
 
 ```bash
+# Monorepo
 python3 long_underwater_web/backtest_second_week_drawdown.py ^TWII 2020-01-01
+# 獨立 clone（於 repo 根目錄）
+python3 backtest_second_week_drawdown.py ^TWII 2020-01-01
 ```
 
 進場後**第二個週界週**，若該週最後收盤仍低於進場價（定義 A），則統計該週盤中最低相對進場價之跌幅%。

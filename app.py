@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import html
+import importlib.util
 import re
 import subprocess
 import sys
@@ -45,6 +46,20 @@ from logic import (  # noqa: E402
     segments_to_options,
 )
 
+def _load_bottom_strategy_module():
+    """優先載入 long_underwater_web 內建策略檔，避免環境路徑差異造成結果不一致。"""
+    local_bs = _APP_DIR / "bottom_strategy.py"
+    if local_bs.exists():
+        spec = importlib.util.spec_from_file_location("bottom_strategy_local", str(local_bs))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"無法載入底部策略模組：{local_bs}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    import bottom_strategy as bs_mod  # type: ignore
+
+    return bs_mod
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_wtx_night_price():
@@ -65,7 +80,7 @@ def _cached_bottom_strategy_summary(
     注意：_refresh_key 只用來讓快取可定期失效；真正的取值由 trade_date_str 決定。
     """
     try:
-        import bottom_strategy as bs_mod
+        bs_mod = _load_bottom_strategy_module()
 
         target = "twi"
         stock_id = bs_mod.resolve_stock_id(target, "加權指數")
@@ -279,7 +294,7 @@ def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | No
     用於 15:00 後先顯示最新日，缺欄位標示尚未更新。
     """
     try:
-        import bottom_strategy as bs_mod
+        bs_mod = _load_bottom_strategy_module()
 
         stock_id = bs_mod.resolve_stock_id("twi", "加權指數")
         start_date_str = "2019-01-01"

@@ -135,11 +135,18 @@ def _cached_bottom_strategy_summary(
         m_df = bs_mod.select_main_table(html_m)
 
         feat = bs_mod.build_feature_frame(k_df, b_df, m_df)
-        feat = bs_mod.add_score(feat)
         if feat is None or len(feat) == 0:
             return None, "NO_DATA: bottom strategy feature is empty"
 
+        # 與 bottom_strategy.py 主程式保持一致：即使 data 端點回傳超出區間，也再做一次嚴格日期過濾。
+        start_date = pd.Timestamp(start_date_str).normalize()
+        end_date = pd.Timestamp(end_date_str).normalize()
         feat = feat.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        feat = feat[(feat["date"] >= start_date) & (feat["date"] <= end_date)].copy()
+        if len(feat) == 0:
+            return None, "NO_DATA: filtered feature is empty in requested date range"
+        feat = bs_mod.add_score(feat)
+
         latest_available_date = None
         if len(feat) > 0 and feat.get("date") is not None:
             try:

@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -55,59 +55,128 @@ def _cached_wtx_night_price():
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _cached_bottom_strategy_summary(_refresh_key: str) -> tuple[dict | None, str | None]:
-    """固定指令執行 bottom_strategy，回傳摘要與錯誤訊息。"""
-    script_dir = _STK_ROOT / "tw_index_futur"
-    cmd = [
-        sys.executable,
-        "bottom_strategy.py",
-        "--target",
-        "twi",
-        "--alert-score",
-        "6",
-        "--watch-score",
-        "4",
-    ]
+def _cached_bottom_strategy_summary(
+    _refresh_key: str,
+    trade_date_str: str,
+) -> tuple[dict | None, str | None]:
+    """
+    以指定日期計算 bottom strategy（取得最近一筆 <= 指定日期的交易日）。
+
+    注意：_refresh_key 只用來讓快取可定期失效；真正的取值由 trade_date_str 決定。
+    """
     try:
-        cp = subprocess.run(
-            cmd,
-            cwd=str(script_dir),
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=False,
+        import bottom_strategy as bs_mod
+
+        target = "twi"
+        stock_id = bs_mod.resolve_stock_id(target, "加權指數")
+        cfg = bs_mod.StrategyConfig(
+            stock_id=stock_id,
+            score_alert=6,
+            score_watch=4,
+            timeout_sec=30,
         )
+
+        trade_date = pd.Timestamp(trade_date_str).normalize()
+        if pd.isna(trade_date):
+            return None, f"invalid trade_date_str: {trade_date_str}"
+
+        start_date_str = "2019-01-01"
+        end_date_str = trade_date.strftime("%Y-%m-%d")
+        requests_spec = bs_mod.build_post_requests(cfg.stock_id, start_date_str, end_date_str)
+        legacy_urls = bs_mod.build_legacy_urls(cfg.stock_id)
+        sess = bs_mod.requests.Session()
+        html_k, _ = bs_mod.fetch_goodinfo_html_post(
+            sess,
+            requests_spec["k"]["url"],
+            requests_spec["k"]["data"],
+            timeout=cfg.timeout_sec,
+            fallback_url=legacy_urls["k"],
+            allow_legacy_fallback=False,
+            query_url=requests_spec["k"]["query_url"],
+            referer_url=requests_spec["k"]["referer_url"],
+        )
+        html_b, _ = bs_mod.fetch_goodinfo_html_post(
+            sess,
+            requests_spec["buy"]["url"],
+            requests_spec["buy"]["data"],
+            timeout=cfg.timeout_sec,
+            fallback_url=legacy_urls["buy"],
+            allow_legacy_fallback=False,
+            query_url=requests_spec["buy"]["query_url"],
+            referer_url=requests_spec["buy"]["referer_url"],
+        )
+        html_m, _ = bs_mod.fetch_goodinfo_html_post(
+            sess,
+            requests_spec["margin"]["url"],
+            requests_spec["margin"]["data"],
+            timeout=cfg.timeout_sec,
+            fallback_url=legacy_urls["margin"],
+            allow_legacy_fallback=False,
+            query_url=requests_spec["margin"]["query_url"],
+            referer_url=requests_spec["margin"]["referer_url"],
+        )
+        k_df = bs_mod.select_main_table(html_k)
+        b_df = bs_mod.select_main_table(html_b)
+        m_df = bs_mod.select_main_table(html_m)
+
+        feat = bs_mod.build_feature_frame(k_df, b_df, m_df)
+        feat = bs_mod.add_score(feat)
+        if feat is None or len(feat) == 0:
+            return None, "NO_DATA: bottom strategy feature is empty"
+
+        feat = feat.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        latest_available_date = None
+        if len(feat) > 0 and feat.get("date") is not None:
+            try:
+                latest_available_date = pd.Timestamp(feat["date"].max()).strftime("%Y-%m-%d")
+            except Exception:
+                latest_available_date = None
+        # 指定日期可能落在週末/假日：取「最近一筆 <= 指定日期」；若完全沒有則取最早一筆。
+        cand = feat[feat["date"] <= trade_date]
+        row = cand.iloc[-1] if len(cand) else feat.iloc[0]
+
+        score = int(row["score"])
+        if score >= cfg.score_alert:
+            level = "ALERT"
+        elif score >= cfg.score_watch:
+            level = "WATCH"
+        else:
+            level = "NO_SIGNAL"
+
+        yn = lambda v: "是" if bool(v) else "否"
+
+        hits = (
+            "大跌=" + yn(row["big_drop"]) + ", "
+            "高振幅=" + yn(row["high_amp"]) + ", "
+            "高成交量=" + yn(row["high_vol"]) + ", "
+            "法人偏空=" + yn(row["inst_sell"]) + ", "
+            "融資減少=" + yn(row["mgn_reduce"]) + ", "
+            "融券減少=" + yn(row["short_reduce"])
+        )
+
+        snapshot = (
+            f"漲跌幅={float(row['chg_pct']):.2f}%, "
+            f"振幅={float(row['amp_pct']):.2f}%, "
+            f"成交量={float(row['volume_b']):.2f}億元, "
+            f"三大法人買賣超={float(row['inst_net_100m']):.2f}億元, "
+            f"融資增減={float(row['mgn_chg_100m']):.2f}億元, "
+            f"融券增減率={float(row['short_chg_pct']):.2f}%"
+        )
+
+        panel_date = pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
+        score_text = f"{score} / 6"
+
+        return {
+            "target": target,
+            "date": panel_date,
+            "latest_available_date": latest_available_date,
+            "level": level,
+            "score": score_text,
+            "hits": hits,
+            "snapshot": snapshot,
+        }, None
     except Exception as e:
         return None, str(e)
-
-    out = (cp.stdout or "").strip()
-    if cp.returncode != 0:
-        err = (cp.stderr or "").strip()
-        return None, f"exit={cp.returncode}; {err[:200] if err else '執行失敗'}"
-    if not out:
-        return None, "無輸出"
-
-    def pick(pat: str) -> str | None:
-        m = re.search(pat, out, flags=re.MULTILINE)
-        return m.group(1).strip() if m else None
-
-    summary = {
-        "target": pick(r"^target:\s*(.+)$"),
-        "date": pick(r"^date:\s*(.+)$"),
-        "level": pick(r"^signal_level:\s*(.+)$"),
-        "score": pick(r"^score:\s*(.+)$"),
-        "hits": None,
-        "snapshot": None,
-    }
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("條件命中:"):
-            summary["hits"] = line.replace("條件命中:", "", 1).strip()
-        elif line.startswith("快照數值:"):
-            summary["snapshot"] = line.replace("快照數值:", "", 1).strip()
-    return summary, None
 
 
 @st.cache_data(show_spinner="下載週線與日線…")
@@ -213,11 +282,41 @@ def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | No
         import bottom_strategy as bs_mod
 
         stock_id = bs_mod.resolve_stock_id("twi", "加權指數")
-        urls = bs_mod.build_urls(stock_id)
+        start_date_str = "2019-01-01"
+        end_date_str = datetime.now().strftime("%Y-%m-%d")
+        requests_spec = bs_mod.build_post_requests(stock_id, start_date_str, end_date_str)
+        legacy_urls = bs_mod.build_legacy_urls(stock_id)
         sess = bs_mod.requests.Session()
-        html_k = bs_mod.fetch_goodinfo_html(sess, urls["k"], timeout=30)
-        html_b = bs_mod.fetch_goodinfo_html(sess, urls["buy"], timeout=30)
-        html_m = bs_mod.fetch_goodinfo_html(sess, urls["margin"], timeout=30)
+        html_k, _ = bs_mod.fetch_goodinfo_html_post(
+            sess,
+            requests_spec["k"]["url"],
+            requests_spec["k"]["data"],
+            timeout=30,
+            fallback_url=legacy_urls["k"],
+            allow_legacy_fallback=False,
+            query_url=requests_spec["k"]["query_url"],
+            referer_url=requests_spec["k"]["referer_url"],
+        )
+        html_b, _ = bs_mod.fetch_goodinfo_html_post(
+            sess,
+            requests_spec["buy"]["url"],
+            requests_spec["buy"]["data"],
+            timeout=30,
+            fallback_url=legacy_urls["buy"],
+            allow_legacy_fallback=False,
+            query_url=requests_spec["buy"]["query_url"],
+            referer_url=requests_spec["buy"]["referer_url"],
+        )
+        html_m, _ = bs_mod.fetch_goodinfo_html_post(
+            sess,
+            requests_spec["margin"]["url"],
+            requests_spec["margin"]["data"],
+            timeout=30,
+            fallback_url=legacy_urls["margin"],
+            allow_legacy_fallback=False,
+            query_url=requests_spec["margin"]["query_url"],
+            referer_url=requests_spec["margin"]["referer_url"],
+        )
         k_df = bs_mod.select_main_table(html_k)
         b_df = bs_mod.select_main_table(html_b)
         m_df = bs_mod.select_main_table(html_m)
@@ -250,6 +349,7 @@ def _render_bottom_strategy_panel(
     bs: dict | None,
     bs_err: str | None,
     partial_latest: dict | None = None,
+    allow_partial_latest: bool = False,
 ) -> None:
     if bs_err:
         st.caption(f"底部策略：讀取失敗（{bs_err}）")
@@ -260,7 +360,7 @@ def _render_bottom_strategy_panel(
     bs_date = pd.to_datetime(bs.get("date"), errors="coerce")
     partial_date = pd.to_datetime((partial_latest or {}).get("date"), errors="coerce")
     use_partial = bool(
-        _is_after_1500()
+        allow_partial_latest
         and partial_latest
         and pd.notna(partial_date)
         and (pd.isna(bs_date) or partial_date > bs_date)
@@ -272,9 +372,128 @@ def _render_bottom_strategy_panel(
         panel_date = partial_latest.get("date") or panel_date
         score_text = "…"
 
+    # 底部策略標題 + 日期選擇器（calendar）+ 前後一天按鈕：同一列呈現，避免往下排列。
+    today = datetime.now().date()
+    min_bs_date = today - timedelta(days=365)
+    max_bs_date = today
+
+    # 預設日期：採 goodinfo 查到的「最新可用日期」（也就是 panel_date）。
+    default_trade_date = pd.to_datetime(panel_date, errors="coerce")
+    if pd.notna(default_trade_date):
+        default_trade_date = default_trade_date.date()
+    else:
+        default_trade_date = max_bs_date
+
+    # 可選的最大日期：以 goodinfo 查到的「全域最新可用日期」為上限
+    # 注意：panel_date 會隨使用者調整而變動（例如從 25 切到 24），
+    # 但這不應該影響日曆 max；因此使用 bs（底部策略同源）回傳的 latest_available_date。
+    latest_available_raw = bs.get("latest_available_date") if isinstance(bs, dict) else None
+    latest_available = pd.to_datetime(latest_available_raw, errors="coerce")
+    max_bs_date = latest_available.date() if pd.notna(latest_available) else default_trade_date
+
+    # 若尚未被設定（或 session_state 殘留了超出 goodinfo 最新日期的值），就改成 goodinfo 的最新日期。
+    cur_ss_date = st.session_state.get("bs_trade_date")
+    try:
+        cur_ss_date_parsed = pd.to_datetime(cur_ss_date).date() if cur_ss_date is not None else None
+    except Exception:
+        cur_ss_date_parsed = None
+
+    if cur_ss_date_parsed is None:
+        st.session_state["bs_trade_date"] = default_trade_date
+    else:
+        if cur_ss_date_parsed < min_bs_date:
+            st.session_state["bs_trade_date"] = min_bs_date
+        elif cur_ss_date_parsed > max_bs_date:
+            st.session_state["bs_trade_date"] = max_bs_date
+
+    cur_date = st.session_state.get("bs_trade_date", default_trade_date)
+
+    can_prev = cur_date > min_bs_date
+    can_next = cur_date < max_bs_date
+
+    # 右側（◀/▶ + calendar）更靠近標題文字：調整欄位權重並縮小列間距
+    # 標題 + 控制列（◀ / calendar icon / ▶）：以自訂 flex row 呈現，確保緊鄰且手機不換行。
     st.markdown(
-        f'<div class="v2-section v2-section--first">底部策略 — {html.escape(str(panel_date))}　分數 {html.escape(str(score_text))}</div>',
+        f"""
+        <div class="bs-header-row">
+          <div class="bs-title">
+            底部策略 — {html.escape(str(panel_date))}　分數 {html.escape(str(score_text))}
+          </div>
+          <div class="bs-controls" aria-label="底部策略日期控制">
+            <button class="bs-ctrl-btn" type="button" id="bsPrev" aria-label="前一天" {("disabled" if not can_prev else "")}>◀</button>
+            <button class="bs-ctrl-btn bs-ctrl-cal" type="button" id="bsCal" aria-label="選擇日期"></button>
+            <button class="bs-ctrl-btn" type="button" id="bsNext" aria-label="後一天">▶</button>
+          </div>
+        </div>
+        """,
         unsafe_allow_html=True,
+    )
+
+    # 注意：避免在 `st.date_input(key="bs_trade_date")` 實例化之後再修改同一個 key。
+    # 保留原本 widget 以維持狀態與邏輯，但移出畫面；由上面的 icon 按鈕觸發它們。
+    hidden_prev = st.button("◀", key="bs_trade_date_prev")
+    if hidden_prev and cur_date > min_bs_date:
+        st.session_state["bs_trade_date"] = max(min_bs_date, cur_date - timedelta(days=1))
+        st.rerun()
+
+    hidden_next = st.button("▶", key="bs_trade_date_next")
+    if hidden_next and cur_date < max_bs_date:
+        st.session_state["bs_trade_date"] = min(max_bs_date, cur_date + timedelta(days=1))
+        st.rerun()
+
+    st.date_input(
+        "底部策略日期（最近一年）",
+        min_value=min_bs_date,
+        max_value=max_bs_date,
+        key="bs_trade_date",
+        label_visibility="collapsed",
+    )
+
+    components.html(
+        """
+        <script>
+        (function () {
+          var DOC = window.parent.document;
+          function qs(sel){ try { return DOC.querySelector(sel); } catch(e){ return null; } }
+          function bindOnce(id, fn){
+            var el = qs('#' + id);
+            if (!el) return;
+            if (el.__bsBound) return;
+            el.__bsBound = true;
+            el.addEventListener('click', fn);
+          }
+
+          function clickPrev(){
+            var btn = qs('div.st-key-bs_trade_date_prev button');
+            if (btn) btn.click();
+          }
+          function clickNext(){
+            var btn = qs('div.st-key-bs_trade_date_next button');
+            if (btn) btn.click();
+          }
+          function openCalendar(){
+            // 依據不同 Streamlit/版本，input/層級可能略有差異：多嘗試幾種 selector。
+            var input = qs('div.st-key-bs_trade_date input[data-testid="stDateInputField"]');
+            if (!input) input = qs('div[data-testid="stDateInput"] input[data-testid="stDateInputField"]');
+            if (input) {
+              input.focus();
+              input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              return;
+            }
+
+            // fallback：點擊 base input 容器（通常可觸發 datepicker 開啟）
+            var base = qs('div.st-key-bs_trade_date div[data-baseweb="input"]');
+            if (!base) base = qs('div[data-testid="stDateInput"] div[data-baseweb="input"]');
+            if (base) base.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          }
+
+          bindOnce('bsPrev', clickPrev);
+          bindOnce('bsNext', clickNext);
+          bindOnce('bsCal', openCalendar);
+        })();
+        </script>
+        """,
+        height=0,
     )
 
     if use_partial and partial_latest:
@@ -475,6 +694,188 @@ st.markdown(
       color: var(--accent-amber);
     }
     .v2-alert-bar a { color: inherit; text-decoration: underline; }
+
+    /* 底部策略：標題 + 控制（◀ calendar ▶）同列緊貼 */
+    .bs-header-row{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:8px;
+      margin: 0.2rem 0 0.15rem 0;
+      overflow: visible;
+      flex-wrap: nowrap;
+    }
+    .bs-title{
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: var(--accent-blue);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border-left: 3px solid var(--accent-blue);
+      padding-left: 0.6rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    .bs-controls{
+      display:flex;
+      align-items:center;
+      gap:4px;
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+    .bs-ctrl-btn{
+      width: 26px;
+      height: 26px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: #111827;
+      font-weight: 700;
+      line-height: 1;
+      padding: 0;
+      margin: 0;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+      cursor: pointer;
+      user-select: none;
+    }
+    .bs-ctrl-btn:disabled{
+      opacity: 0.45 !important;
+      cursor: not-allowed !important;
+      box-shadow: none !important;
+    }
+    .bs-ctrl-cal{
+      position: relative;
+      color: transparent; /* 只顯示 icon */
+    }
+    .bs-ctrl-cal::after{
+      content:"";
+      position:absolute;
+      left:50%;
+      top:50%;
+      transform: translate(-50%, -50%);
+      width: 14px;
+      height: 14px;
+      background-repeat:no-repeat;
+      background-position:center;
+      background-size:contain;
+      background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%2315803d'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Crect%20x='3'%20y='4'%20width='18'%20height='18'%20rx='2'%20/%3E%3Cline%20x1='16'%20y1='2'%20x2='16'%20y2='6'%20/%3E%3Cline%20x1='8'%20y1='2'%20x2='8'%20y2='6'%20/%3E%3Cline%20x1='3'%20y1='10'%20x2='21'%20y2='10'%20/%3E%3C/svg%3E");
+      pointer-events:none;
+    }
+
+    /* 隱藏底部策略用的原生 widgets（仍保留於 DOM 供 JS 觸發） */
+    div.st-key-bs_trade_date_prev,
+    div.st-key-bs_trade_date_next,
+    div.st-key-bs_trade_date{
+      position: absolute !important;
+      left: 0 !important;
+      top: 0 !important;
+      width: 1px !important;
+      height: 1px !important;
+      overflow: hidden !important;
+      opacity: 0 !important;
+      pointer-events: auto !important;
+    }
+
+    /* 底部策略日期：只留一顆 calendar icon（文字隱藏，icon 由 CSS 疊上） */
+    div[data-testid="stDateInput"] {
+      width: 26px !important;
+      min-width: 26px !important;
+      height: 26px !important;
+      position: relative !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      overflow: visible !important;
+    }
+    /* 隱藏 label，避免佔位 */
+    div[data-testid="stDateInput"] label[data-testid="stWidgetLabel"] {
+      display: none !important;
+    }
+    div[data-testid="stDateInput"] div[data-baseweb="input"] {
+      width: 26px !important;
+      height: 26px !important;
+      min-width: 26px !important;
+      min-height: 26px !important;
+    }
+    div[data-testid="stDateInput"] div[data-baseweb="base-input"] {
+      border: 0 !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      width: 26px !important;
+      height: 26px !important;
+    }
+    div[data-testid="stDateInput"] input[type="text"] {
+      color: transparent !important;
+      caret-color: transparent !important;
+      background: transparent !important;
+      border: 0 !important;
+      outline: 0 !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      width: 26px !important;
+      height: 26px !important;
+      min-width: 26px !important;
+      min-height: 26px !important;
+      opacity: 0 !important;
+    }
+    div[data-testid="stDateInput"] button {
+      width: 26px !important;
+      min-width: 26px !important;
+      height: 26px !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      border: 0 !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      overflow: visible !important;
+    }
+    /* 隱藏 Streamlit 內建的 icon，我們改用 ::after 疊上（避免 svg 被裁掉/顏色錯誤） */
+    div[data-testid="stDateInput"] button svg {
+      opacity: 0 !important;
+      visibility: hidden !important;
+      display: none !important;
+    }
+    div[data-testid="stDateInput"]::after {
+      content: "";
+      position: absolute !important;
+      left: 50% !important;
+      top: 50% !important;
+      transform: translate(-50%, -50%) !important;
+      width: 14px !important;
+      height: 14px !important;
+      background-repeat: no-repeat !important;
+      background-position: center !important;
+      background-size: contain !important;
+      /* 先用內建 calendar icon；若你後續貼 flaticon 的 base64/svg，我可把這段換成指定那顆。 */
+      background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%2315803d'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Crect%20x='3'%20y='4'%20width='18'%20height='18'%20rx='2'%20/%3E%3Cline%20x1='16'%20y1='2'%20x2='16'%20y2='6'%20/%3E%3Cline%20x1='8'%20y1='2'%20x2='8'%20y2='6'%20/%3E%3Cline%20x1='3'%20y1='10'%20x2='21'%20y2='10'%20/%3E%3C/svg%3E");
+      pointer-events: none !important;
+      z-index: 2 !important;
+    }
+
+    /* 讓 ◀ / ▶ 按鈕更緊貼（減少 margin/padding 佔位） */
+    div.st-key-bs_trade_date_prev,
+    div.st-key-bs_trade_date_next {
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+    div.st-key-bs_trade_date_prev button,
+    div.st-key-bs_trade_date_next button {
+      width: 26px !important;
+      height: 26px !important;
+      padding: 0 !important;
+      margin: 0 !important;
+    }
     @media (max-width: 768px) {
       [data-testid="stAppViewContainer"] .block-container {
         padding: 0 0.75rem 1rem 0.75rem !important;
@@ -589,6 +990,16 @@ with st.sidebar:
 
 _t = ticker.strip()
 _sd = start_date.strip()
+
+# 底部策略日期（UI 會在渲染底部策略面板後出現，但抓取時需要這個值先存在）
+_today = datetime.now().date()
+_min_bs_date = _today - timedelta(days=365)
+_max_bs_date = _today
+st.session_state.setdefault("bs_trade_date", _max_bs_date)
+_bs_trade_date = st.session_state.get("bs_trade_date", _max_bs_date)
+_bs_trade_date_str = pd.Timestamp(_bs_trade_date).strftime("%Y-%m-%d")
+_allow_partial_latest = _is_after_1500() and _bs_trade_date == _max_bs_date
+
 bs_slot = st.empty()
 load_slot = st.empty()
 
@@ -601,10 +1012,14 @@ market_err: Exception | None = None
 
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
-        executor.submit(_cached_bottom_strategy_summary, _bottom_refresh_key()): "bs",
+        executor.submit(
+            _cached_bottom_strategy_summary,
+            _bottom_refresh_key(),
+            _bs_trade_date_str,
+        ): "bs",
         executor.submit(load_market_data, _t, _sd, _market_refresh_key()): "market",
     }
-    if _is_after_1500():
+    if _allow_partial_latest:
         futures[executor.submit(_cached_bottom_strategy_partial_latest, _bottom_refresh_key())] = "bs_partial"
     for future in as_completed(futures):
         kind = futures[future]
@@ -614,7 +1029,12 @@ with ThreadPoolExecutor(max_workers=2) as executor:
             except Exception as e:
                 _bs, _bs_err = None, str(e)
             with bs_slot.container():
-                _render_bottom_strategy_panel(_bs, _bs_err, _bs_partial)
+                _render_bottom_strategy_panel(
+                    _bs,
+                    _bs_err,
+                    _bs_partial,
+                    allow_partial_latest=_allow_partial_latest,
+                )
         elif kind == "bs_partial":
             try:
                 _bs_partial, _bs_partial_err = future.result()
@@ -622,7 +1042,12 @@ with ThreadPoolExecutor(max_workers=2) as executor:
                 _bs_partial, _bs_partial_err = None, str(e)
             # partial 失敗不阻斷：僅回落完整訊號顯示
             with bs_slot.container():
-                _render_bottom_strategy_panel(_bs, _bs_err, _bs_partial)
+                _render_bottom_strategy_panel(
+                    _bs,
+                    _bs_err,
+                    _bs_partial,
+                    allow_partial_latest=_allow_partial_latest,
+                )
         else:
             try:
                 df_w, stats, daily_we = future.result()

@@ -135,18 +135,11 @@ def _cached_bottom_strategy_summary(
         m_df = bs_mod.select_main_table(html_m)
 
         feat = bs_mod.build_feature_frame(k_df, b_df, m_df)
+        feat = bs_mod.add_score(feat)
         if feat is None or len(feat) == 0:
             return None, "NO_DATA: bottom strategy feature is empty"
 
-        # 與 bottom_strategy.py 主程式保持一致：即使 data 端點回傳超出區間，也再做一次嚴格日期過濾。
-        start_date = pd.Timestamp(start_date_str).normalize()
-        end_date = pd.Timestamp(end_date_str).normalize()
         feat = feat.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-        feat = feat[(feat["date"] >= start_date) & (feat["date"] <= end_date)].copy()
-        if len(feat) == 0:
-            return None, "NO_DATA: filtered feature is empty in requested date range"
-        feat = bs_mod.add_score(feat)
-
         latest_available_date = None
         if len(feat) > 0 and feat.get("date") is not None:
             try:
@@ -217,10 +210,17 @@ def _market_refresh_key() -> str:
 
 
 def _bottom_refresh_key() -> str:
-    """底部策略固定每 30 分鐘換 key。"""
+    """底部策略固定每 30 分鐘換 key；同時把 `bottom_strategy.py` 檔案 mtime 納入以避免快取卡住。"""
     now = datetime.now()
     slot = (now.minute // 30) * 30
-    return now.replace(minute=slot, second=0, microsecond=0).strftime("btm-%Y%m%d-%H%M")
+    code_mtime = 0
+    try:
+        local_bs_file = _APP_DIR / "bottom_strategy.py"
+        if local_bs_file.exists():
+            code_mtime = int(local_bs_file.stat().st_mtime)
+    except Exception:
+        code_mtime = 0
+    return now.replace(minute=slot, second=0, microsecond=0).strftime(f"btm-%Y%m%d-%H%M-{code_mtime}")
 
 
 def _calc_week_end_from_trade_date(trade_date: pd.Timestamp) -> pd.Timestamp:
@@ -372,6 +372,7 @@ def _render_bottom_strategy_panel(
     bs_err: str | None,
     partial_latest: dict | None = None,
     allow_partial_latest: bool = False,
+    show_controls: bool = True,
 ) -> None:
     if bs_err:
         st.caption(f"底部策略：讀取失敗（{bs_err}）")
@@ -406,12 +407,11 @@ def _render_bottom_strategy_panel(
     else:
         default_trade_date = max_bs_date
 
-    # 可選的最大日期：以 goodinfo 查到的「全域最新可用日期」為上限
-    # 注意：panel_date 會隨使用者調整而變動（例如從 25 切到 24），
-    # 但這不應該影響日曆 max；因此使用 bs（底部策略同源）回傳的 latest_available_date。
-    latest_available_raw = bs.get("latest_available_date") if isinstance(bs, dict) else None
-    latest_available = pd.to_datetime(latest_available_raw, errors="coerce")
-    max_bs_date = latest_available.date() if pd.notna(latest_available) else default_trade_date
+    # 可選的最大日期：固定用 UI 上限（今天），避免「選較早日期 -> max_value 被動縮小 -> 回不到原本較晚日期」
+    # 的狀況。
+    #
+    # 注意：bs 回傳的 latest_available_date 是依賴目前 trade_date 往回抓資料得到的「當次最新」，
+    # 因此不應直接用它來當 st.date_input 的 max_value。
 
     # 若尚未被設定（或 session_state 殘留了超出 goodinfo 最新日期的值），就改成 goodinfo 的最新日期。
     cur_ss_date = st.session_state.get("bs_trade_date")
@@ -435,13 +435,16 @@ def _render_bottom_strategy_panel(
 
     # 右側（◀/▶ + calendar）更靠近標題文字：調整欄位權重並縮小列間距
     # 標題 + 控制列（◀ / calendar icon / ▶）：以自訂 flex row 呈現，確保緊鄰且手機不換行。
+    # 若 show_controls=False（例如 partial_latest 呼叫），則不渲染控制元件/日期輸入框，
+    # 避免同一 rerun 內重複建立 Streamlit widgets key 而觸發 StreamlitDuplicateElementKey。
+    controls_style = "" if show_controls else "opacity:0.5; pointer-events:none;"
     st.markdown(
         f"""
         <div class="bs-header-row">
           <div class="bs-title">
             底部策略 — {html.escape(str(panel_date))}　分數 {html.escape(str(score_text))}
           </div>
-          <div class="bs-controls" aria-label="底部策略日期控制">
+          <div class="bs-controls" aria-label="底部策略日期控制" style="{controls_style}">
             <button class="bs-ctrl-btn" type="button" id="bsPrev" aria-label="前一天" {("disabled" if not can_prev else "")}>◀</button>
             <button class="bs-ctrl-btn bs-ctrl-cal" type="button" id="bsCal" aria-label="選擇日期"></button>
             <button class="bs-ctrl-btn" type="button" id="bsNext" aria-label="後一天">▶</button>
@@ -451,72 +454,73 @@ def _render_bottom_strategy_panel(
         unsafe_allow_html=True,
     )
 
-    # 注意：避免在 `st.date_input(key="bs_trade_date")` 實例化之後再修改同一個 key。
-    # 保留原本 widget 以維持狀態與邏輯，但移出畫面；由上面的 icon 按鈕觸發它們。
-    hidden_prev = st.button("◀", key="bs_trade_date_prev")
-    if hidden_prev and cur_date > min_bs_date:
-        st.session_state["bs_trade_date"] = max(min_bs_date, cur_date - timedelta(days=1))
-        st.rerun()
+    if show_controls:
+        # 注意：避免在 `st.date_input(key="bs_trade_date")` 實例化之後再修改同一個 key。
+        # 保留原本 widget 以維持狀態與邏輯，但移出畫面；由上面的 icon 按鈕觸發它們。
+        hidden_prev = st.button("◀", key="bs_trade_date_prev")
+        if hidden_prev and cur_date > min_bs_date:
+            st.session_state["bs_trade_date"] = max(min_bs_date, cur_date - timedelta(days=1))
+            st.rerun()
 
-    hidden_next = st.button("▶", key="bs_trade_date_next")
-    if hidden_next and cur_date < max_bs_date:
-        st.session_state["bs_trade_date"] = min(max_bs_date, cur_date + timedelta(days=1))
-        st.rerun()
+        hidden_next = st.button("▶", key="bs_trade_date_next")
+        if hidden_next and cur_date < max_bs_date:
+            st.session_state["bs_trade_date"] = min(max_bs_date, cur_date + timedelta(days=1))
+            st.rerun()
 
-    st.date_input(
-        "底部策略日期（最近一年）",
-        min_value=min_bs_date,
-        max_value=max_bs_date,
-        key="bs_trade_date",
-        label_visibility="collapsed",
-    )
+        st.date_input(
+            "底部策略日期（最近一年）",
+            min_value=min_bs_date,
+            max_value=max_bs_date,
+            key="bs_trade_date",
+            label_visibility="collapsed",
+        )
 
-    components.html(
-        """
-        <script>
-        (function () {
-          var DOC = window.parent.document;
-          function qs(sel){ try { return DOC.querySelector(sel); } catch(e){ return null; } }
-          function bindOnce(id, fn){
-            var el = qs('#' + id);
-            if (!el) return;
-            if (el.__bsBound) return;
-            el.__bsBound = true;
-            el.addEventListener('click', fn);
-          }
+        components.html(
+            """
+            <script>
+            (function () {
+              var DOC = window.parent.document;
+              function qs(sel){ try { return DOC.querySelector(sel); } catch(e){ return null; } }
+              function bindOnce(id, fn){
+                var el = qs('#' + id);
+                if (!el) return;
+                if (el.__bsBound) return;
+                el.__bsBound = true;
+                el.addEventListener('click', fn);
+              }
 
-          function clickPrev(){
-            var btn = qs('div.st-key-bs_trade_date_prev button');
-            if (btn) btn.click();
-          }
-          function clickNext(){
-            var btn = qs('div.st-key-bs_trade_date_next button');
-            if (btn) btn.click();
-          }
-          function openCalendar(){
-            // 依據不同 Streamlit/版本，input/層級可能略有差異：多嘗試幾種 selector。
-            var input = qs('div.st-key-bs_trade_date input[data-testid="stDateInputField"]');
-            if (!input) input = qs('div[data-testid="stDateInput"] input[data-testid="stDateInputField"]');
-            if (input) {
-              input.focus();
-              input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-              return;
-            }
+              function clickPrev(){
+                var btn = qs('div.st-key-bs_trade_date_prev button');
+                if (btn) btn.click();
+              }
+              function clickNext(){
+                var btn = qs('div.st-key-bs_trade_date_next button');
+                if (btn) btn.click();
+              }
+              function openCalendar(){
+                // 依據不同 Streamlit/版本，input/層級可能略有差異：多嘗試幾種 selector。
+                var input = qs('div.st-key-bs_trade_date input[data-testid="stDateInputField"]');
+                if (!input) input = qs('div[data-testid="stDateInput"] input[data-testid="stDateInputField"]');
+                if (input) {
+                  input.focus();
+                  input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                  return;
+                }
 
-            // fallback：點擊 base input 容器（通常可觸發 datepicker 開啟）
-            var base = qs('div.st-key-bs_trade_date div[data-baseweb="input"]');
-            if (!base) base = qs('div[data-testid="stDateInput"] div[data-baseweb="input"]');
-            if (base) base.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-          }
+                // fallback：點擊 base input 容器（通常可觸發 datepicker 開啟）
+                var base = qs('div.st-key-bs_trade_date div[data-baseweb="input"]');
+                if (!base) base = qs('div[data-testid="stDateInput"] div[data-baseweb="input"]');
+                if (base) base.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              }
 
-          bindOnce('bsPrev', clickPrev);
-          bindOnce('bsNext', clickNext);
-          bindOnce('bsCal', openCalendar);
-        })();
-        </script>
-        """,
-        height=0,
-    )
+              bindOnce('bsPrev', clickPrev);
+              bindOnce('bsNext', clickNext);
+              bindOnce('bsCal', openCalendar);
+            })();
+            </script>
+            """,
+            height=0,
+        )
 
     if use_partial and partial_latest:
         snap_map = partial_latest.get("snapshot_map", {})
@@ -1050,26 +1054,11 @@ with ThreadPoolExecutor(max_workers=2) as executor:
                 _bs, _bs_err = future.result()
             except Exception as e:
                 _bs, _bs_err = None, str(e)
-            with bs_slot.container():
-                _render_bottom_strategy_panel(
-                    _bs,
-                    _bs_err,
-                    _bs_partial,
-                    allow_partial_latest=_allow_partial_latest,
-                )
         elif kind == "bs_partial":
             try:
                 _bs_partial, _bs_partial_err = future.result()
             except Exception as e:
                 _bs_partial, _bs_partial_err = None, str(e)
-            # partial 失敗不阻斷：僅回落完整訊號顯示
-            with bs_slot.container():
-                _render_bottom_strategy_panel(
-                    _bs,
-                    _bs_err,
-                    _bs_partial,
-                    allow_partial_latest=_allow_partial_latest,
-                )
         else:
             try:
                 df_w, stats, daily_we = future.result()
@@ -1077,6 +1066,16 @@ with ThreadPoolExecutor(max_workers=2) as executor:
             except Exception as e:
                 market_err = e
                 load_slot.empty()
+
+    # 底部策略只渲染一次，避免兩個區塊/重複 key/重複 DOM id 導致點擊失效。
+    with bs_slot.container():
+        _render_bottom_strategy_panel(
+            _bs,
+            _bs_err,
+            _bs_partial,
+            allow_partial_latest=_allow_partial_latest,
+            show_controls=True,
+        )
 
 if market_err is not None:
     st.markdown(

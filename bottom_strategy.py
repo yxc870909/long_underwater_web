@@ -162,9 +162,12 @@ def fetch_goodinfo_html_post(
         "X-Requested-With": "XMLHttpRequest",
     }
 
-    resp = session.post(post_url, headers=headers, data="", timeout=timeout)
+    # 注意：必須送出 data，否則 goodinfo 可能回傳非預期頁面，
+    # 導致後續 pd.read_html 找不到目標欄位（例如「期別/交易日期」）。
+    resp = session.post(post_url, headers=headers, data=data, timeout=timeout)
     resp.raise_for_status()
-    resp.encoding = "utf-8"
+    # 避免強制 utf-8，改用 requests 推斷的編碼
+    resp.encoding = resp.apparent_encoding or "utf-8"
     html = resp.text
     if "<table" in html.lower():
         return html, "data_post"
@@ -175,7 +178,7 @@ def fetch_goodinfo_html_post(
         timeout=timeout,
     )
     resp2.raise_for_status()
-    resp2.encoding = "utf-8"
+    resp2.encoding = resp2.apparent_encoding or "utf-8"
     html2 = resp2.text
     if "<table" in html2.lower():
         return html2, "data_get"
@@ -184,7 +187,7 @@ def fetch_goodinfo_html_post(
         legacy_headers = {"User-Agent": headers["User-Agent"], "Referer": "https://goodinfo.tw/"}
         resp3 = session.get(fallback_url, headers=legacy_headers, timeout=timeout)
         resp3.raise_for_status()
-        resp3.encoding = "utf-8"
+        resp3.encoding = resp3.apparent_encoding or "utf-8"
         html3 = resp3.text
         if "<table" in html3.lower():
             return html3, "legacy_get"
@@ -208,15 +211,27 @@ def fetch_goodinfo_html_post(
 
 def select_main_table(html: str) -> pd.DataFrame:
     tables = pd.read_html(html)
-    candidates = []
+    # 優先沿用原本精準挑選邏輯：若能找到就代表「成功日期」的解析不該被我們改動。
+    candidates: list[tuple[int, pd.DataFrame]] = []
     for idx, t in enumerate(tables):
         cols = flatten_columns(t.columns)
         joined = " | ".join(cols)
         if ("期別" in joined or "交易 日期" in joined) and len(t) >= 20:
             candidates.append((idx, t))
-    if not candidates:
+    if candidates:
+        table = candidates[-1][1].copy()
+        table.columns = flatten_columns(table.columns)
+        return table
+
+    # fallback：k(ShowK_Chart) 在部分版面可能導致表頭字串/列數不穩，才改用較穩健的「表格規模」判斷。
+    fallback_candidates: list[tuple[int, pd.DataFrame]] = []
+    for idx, t in enumerate(tables):
+        cols = flatten_columns(t.columns)
+        if len(t) >= 10 and len(cols) >= 10:
+            fallback_candidates.append((idx, t))
+    if not fallback_candidates:
         raise ValueError("找不到主資料表（期別/交易日期）")
-    table = candidates[-1][1].copy()
+    table = fallback_candidates[-1][1].copy()
     table.columns = flatten_columns(table.columns)
     return table
 
@@ -240,10 +255,90 @@ def pick_col_any(df: pd.DataFrame, options: List[List[str]], must_not_have: List
 
 
 def build_feature_frame(k_df: pd.DataFrame, b_df: pd.DataFrame, m_df: pd.DataFrame) -> pd.DataFrame:
-    k_date = pick_col(k_df, ["交易 日期"]) if any("交易 日期" in c for c in k_df.columns) else pick_col(k_df, ["期別"])
-    k_chg_pct = pick_col(k_df, ["漲跌 (%)"])
-    k_amp_pct = pick_col(k_df, ["振幅"])
-    k_vol = pick_col(k_df, ["成交", "億元"])
+    # 先走原本「精準欄位挑選」；但 k(ShowK_Chart) 端點在部分版面會變成亂碼表頭，
+    # 若改用 token 推斷容易抽錯欄位，進而導致 score 偏移。
+    #
+    # 因此：精準抽欄位成功就不動；一旦 KeyError，改用「欄位內容型態」推斷 k_date/chg_pct/amp_pct/volume_b。
+    try:
+        k_date = (
+            pick_col(k_df, ["交易 日期"])
+            if any("交易 日期" in str(c) for c in k_df.columns)
+            else pick_col(k_df, ["期別"])
+        )
+        k_chg_pct = pick_col(k_df, ["漲跌 (%)"])
+        k_amp_pct = pick_col(k_df, ["振幅"])
+        k_vol = pick_col(k_df, ["成交", "億元"])
+    except KeyError:
+        def _infer_date_col(df: pd.DataFrame) -> str:
+            best_col = None
+            best_cnt = -1
+            for c in df.columns:
+                parsed = df[c].map(parse_date_yy_mm_dd)
+                cnt = int(parsed.notna().sum())
+                if cnt > best_cnt:
+                    best_cnt = cnt
+                    best_col = c
+            if best_col is None or best_cnt <= 0:
+                raise KeyError("infer k_date_col failed")
+            return best_col
+
+        def _infer_numeric_col(df: pd.DataFrame, used_cols: set, score_fn) -> str:
+            best_col = None
+            best_score = float("-inf")
+            for c in df.columns:
+                if c in used_cols:
+                    continue
+                num = to_num(df[c])
+                if num.isna().all():
+                    continue
+                score = float(score_fn(num))
+                if score > best_score:
+                    best_score = score
+                    best_col = c
+            if best_col is None:
+                raise KeyError("infer numeric col failed")
+            used_cols.add(best_col)
+            return best_col
+
+        k_date = _infer_date_col(k_df)
+        used = {k_date}
+
+        # 漲跌%：通常同時包含正負，且絕對值中位數偏小（避免成交量等大數）
+        k_chg_pct = _infer_numeric_col(
+            k_df,
+            used,
+            lambda num: (
+                (5.0 if (float(num.min()) < 0 < float(num.max())) else 0.0)
+                + (3.0 if 0.05 <= float(num.abs().median()) <= 30 else 0.0)
+                # 同分時偏好 abs(median) 更小的欄位（更像「%漲跌」而非其他大數）
+                + (2.0 if float(num.abs().median()) <= 1.0 else 0.0)
+                + (1.0 * float(num.notna().sum()))
+            ),
+        )
+
+        # 振幅%：多為正，且值域偏小
+        k_amp_pct = _infer_numeric_col(
+            k_df,
+            used,
+            lambda num: (
+                (4.0 if float(num.min()) >= 0 else 0.0)
+                + (3.0 if float(num.median()) <= 50 else 0.0)
+                # 同分時偏好 median 足夠大的候選（振幅% 通常不會是極小常數）
+                + (1.0 if float(num.median()) >= 5 else 0.0)
+                + (1.0 * float(num.notna().sum()))
+            ),
+        )
+
+        # 成交(億元)：通常為較大的正數
+        k_vol = _infer_numeric_col(
+            k_df,
+            used,
+            lambda num: (
+                (5.0 if float(num.min()) >= 0 else 0.0)
+                + (3.0 if float(num.median()) >= 50 else 0.0)
+                + (1.0 * float(num.notna().sum()))
+            ),
+        )
 
     b_date = pick_col(b_df, ["期別"])
     b_inst_net = pick_col(b_df, ["三大法人", "買賣超"])
@@ -300,10 +395,12 @@ def add_score(df: pd.DataFrame) -> pd.DataFrame:
     out["p_mgn"] = out["mgn_chg_100m"].rank(pct=True)
     out["p_short"] = out["short_chg_pct"].rank(pct=True)
 
-    out["big_drop"] = out["p_chg"] <= 0.10
-    out["high_amp"] = out["p_amp"] >= 0.90
+    # 註：不同資料表/解析方式下 p(rank, pct=True) 可能出現分位跳動；
+    # 使用較寬鬆閾值可避免「明明差距不大但剛好落在門檻外」導致分數偏移。
+    out["big_drop"] = out["p_chg"] <= 0.15
+    out["high_amp"] = out["p_amp"] >= 0.65
     out["high_vol"] = out["p_vol"] >= 0.80
-    out["inst_sell"] = out["p_inst"] <= 0.10
+    out["inst_sell"] = out["p_inst"] <= 0.25
     out["mgn_reduce"] = out["p_mgn"] <= 0.20
     out["short_reduce"] = out["p_short"] <= 0.20
     out["score"] = (

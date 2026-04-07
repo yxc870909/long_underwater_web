@@ -8,7 +8,6 @@ from __future__ import annotations
 import html
 import importlib.util
 import re
-import textwrap
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,13 +22,15 @@ import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 # 確保可 import tw_index_futur（同層 clone：tw_index_futur 在 app.py 所在目錄；monorepo：在上層目錄）
+# 僅在目錄存在時加入 sys.path，避免 standalone 部署時指到不存在的 /mount/src/tw_index_futur。
 _APP_DIR = Path(__file__).resolve().parent
 if (_APP_DIR / "tw_index_futur").exists():
     _STK_ROOT = _APP_DIR
 else:
     _STK_ROOT = _APP_DIR.parent
-if str(_STK_ROOT / "tw_index_futur") not in sys.path:
-    sys.path.insert(0, str(_STK_ROOT / "tw_index_futur"))
+_tw_path = _STK_ROOT / "tw_index_futur"
+if _tw_path.is_dir() and str(_tw_path) not in sys.path:
+    sys.path.insert(0, str(_tw_path))
 
 # yfinance 預設把 SQLite 快取放在 user_cache_dir；若目錄不可寫或異常會報 unable to open database file
 _yf_cache_dir = _STK_ROOT / ".yfinance_cache"
@@ -439,23 +440,20 @@ def _render_bottom_strategy_panel(
     # 若 show_controls=False（例如 partial_latest 呼叫），則不渲染控制元件/日期輸入框，
     # 避免同一 rerun 內重複建立 Streamlit widgets key 而觸發 StreamlitDuplicateElementKey。
     controls_style = "" if show_controls else "opacity:0.5; pointer-events:none;"
-    # 多行 HTML 若保留程式碼縮排，Markdown 會把 4+ 空白行當成「縮排程式碼區塊」，在雲端版 Streamlit 會整段變成純文字 HTML。
-    st.markdown(
-        textwrap.dedent(
-            f"""
-            <div class="bs-header-row">
-              <div class="bs-title">
-                底部策略 — {html.escape(str(panel_date))}　分數 {html.escape(str(score_text))}
-              </div>
-              <div class="bs-controls" aria-label="底部策略日期控制" style="{controls_style}">
-                <button class="bs-ctrl-btn" type="button" id="bsPrev" aria-label="前一天" {("disabled" if not can_prev else "")}>◀</button>
-                <button class="bs-ctrl-btn bs-ctrl-cal" type="button" id="bsCal" aria-label="選擇日期"></button>
-                <button class="bs-ctrl-btn" type="button" id="bsNext" aria-label="後一天">▶</button>
-              </div>
-            </div>
-            """
-        ).strip(),
-        unsafe_allow_html=True,
+    # 雲端版 Streamlit 上 st.markdown(..., unsafe_allow_html=True) 仍可能經 Markdown 管線而顯示成原始 HTML 字串；
+    # st.html 直接插入 DOM，不依賴 Markdown。（樣式沿用頁面頂部注入的 <style>）
+    prev_dis = " disabled" if not can_prev else ""
+    _style_attr = html.escape(controls_style, quote=True)
+    st.html(
+        "<div class=\"bs-header-row\">"
+        "<div class=\"bs-title\">"
+        f"底部策略 — {html.escape(str(panel_date))}　分數 {html.escape(str(score_text))}"
+        "</div>"
+        f"<div class=\"bs-controls\" aria-label=\"底部策略日期控制\" style=\"{_style_attr}\">"
+        f"<button class=\"bs-ctrl-btn\" type=\"button\" id=\"bsPrev\" aria-label=\"前一天\"{prev_dis}>◀</button>"
+        "<button class=\"bs-ctrl-btn bs-ctrl-cal\" type=\"button\" id=\"bsCal\" aria-label=\"選擇日期\"></button>"
+        "<button class=\"bs-ctrl-btn\" type=\"button\" id=\"bsNext\" aria-label=\"後一天\">▶</button>"
+        "</div></div>"
     )
 
     if show_controls:
@@ -548,7 +546,7 @@ def _render_bottom_strategy_panel(
                 f'<div class="v2-bs-chip-val">{html.escape(val)}</div>'
                 "</div>"
             )
-        st.markdown('<div class="v2-bs-row">' + "".join(chips) + "</div>", unsafe_allow_html=True)
+        st.html('<div class="v2-bs-row">' + "".join(chips) + "</div>")
         return
 
     if bs.get("hits") and bs.get("snapshot"):
@@ -585,7 +583,7 @@ def _render_bottom_strategy_panel(
                 f'<div class="v2-bs-chip-val">{html.escape(str(val))}</div>'
                 "</div>"
             )
-        st.markdown('<div class="v2-bs-row">' + "".join(chips) + "</div>", unsafe_allow_html=True)
+        st.html('<div class="v2-bs-row">' + "".join(chips) + "</div>")
     else:
         if bs.get("hits"):
             st.caption(f"條件命中：{bs['hits']}")

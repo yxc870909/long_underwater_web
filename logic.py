@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,13 +14,35 @@ import pandas as pd
 # 專案內週線狀態機與做多統計（支援同層 repo 與上層 monorepo 兩種結構）
 _APP_DIR = Path(__file__).resolve().parent
 _MONO_ROOT = _APP_DIR.parent
-_TW_CANDIDATES = [
-    _APP_DIR / "tw_index_futur",
-    _MONO_ROOT / "tw_index_futur",
+
+# 以檔案路徑載入，避免 Streamlit／執行緒／sys.path 順序導致找不到模組。
+_FETCH_W_CANDIDATES = [
+    _APP_DIR / "tw_index_futur" / "fetch_daily_stock_data_W.py",
+    _MONO_ROOT / "tw_index_futur" / "fetch_daily_stock_data_W.py",
 ]
-_TW = next((p for p in _TW_CANDIDATES if p.exists()), _TW_CANDIDATES[0])
-if str(_TW) not in sys.path:
-    sys.path.insert(0, str(_TW))
+_FETCH_W_PATH = next((p for p in _FETCH_W_CANDIDATES if p.is_file()), None)
+if _FETCH_W_PATH is not None:
+    _spec = importlib.util.spec_from_file_location("fetch_daily_stock_data_W", _FETCH_W_PATH)
+    if _spec is None or _spec.loader is None:
+        raise ImportError(f"無法載入週線模組：{_FETCH_W_PATH}")
+    _fdw = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_fdw)
+    calculate_long_position_stats = _fdw.calculate_long_position_stats
+    convert_to_weekly_data = _fdw.convert_to_weekly_data
+    fetch_weekly_stock_data = _fdw.fetch_weekly_stock_data
+else:
+    _TW_CANDIDATES = [
+        _APP_DIR / "tw_index_futur",
+        _MONO_ROOT / "tw_index_futur",
+    ]
+    _TW = next((p for p in _TW_CANDIDATES if p.exists()), _TW_CANDIDATES[0])
+    if str(_TW) not in sys.path:
+        sys.path.insert(0, str(_TW))
+    from fetch_daily_stock_data_W import (  # noqa: E402
+        calculate_long_position_stats,
+        convert_to_weekly_data,
+        fetch_weekly_stock_data,
+    )
 
 # 快取目錄：standalone 用 repo 根；monorepo 用 Stk_Ops 根
 if (_APP_DIR / "tw_index_futur").exists():
@@ -30,12 +53,6 @@ _yf_cache_dir.mkdir(parents=True, exist_ok=True)
 import yfinance as yf  # noqa: E402
 
 yf.set_tz_cache_location(str(_yf_cache_dir))
-
-from fetch_daily_stock_data_W import (  # noqa: E402
-    calculate_long_position_stats,
-    convert_to_weekly_data,
-    fetch_weekly_stock_data,
-)
 
 
 def _strip_tz(series: pd.Series) -> pd.Series:

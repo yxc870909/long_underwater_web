@@ -2,6 +2,7 @@ import re
 import time
 import urllib.parse as up
 from dataclasses import dataclass
+from io import StringIO
 from typing import Dict, List
 
 import pandas as pd
@@ -263,7 +264,8 @@ def fetch_goodinfo_html_post(
 
 
 def select_main_table(html: str) -> pd.DataFrame:
-    tables = pd.read_html(html)
+    # Pandas 3.x + 部分環境會把長 HTML 字串誤當檔案路徑而 open() 失敗；用 StringIO 明確當記憶體內容。
+    tables = pd.read_html(StringIO(html))
     # 優先沿用原本精準挑選邏輯：若能找到就代表「成功日期」的解析不該被我們改動。
     candidates: list[tuple[int, pd.DataFrame]] = []
     for idx, t in enumerate(tables):

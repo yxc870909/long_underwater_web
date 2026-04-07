@@ -125,19 +125,64 @@ def _extract_cookie_prefix(html: str) -> str:
     return "2.4|0|0|"
 
 
-def ensure_goodinfo_client_key(session: requests.Session, timeout: int = 30) -> None:
-    has_key = any(c.name == "CLIENT_KEY" and "goodinfo.tw" in (c.domain or "") for c in session.cookies)
-    if has_key:
-        return
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://goodinfo.tw/"}
-    r = session.get(BASE_URL, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    r.encoding = "utf-8"
-    prefix = _extract_cookie_prefix(r.text)
+def _goodinfo_seed_headers(referer: str = "https://goodinfo.tw/") -> Dict[str, str]:
+    """與實際瀏覽器較接近，降低 /tw/ 回 500 或阻擋非瀏覽器請求的機率。"""
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": referer,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin" if "goodinfo.tw" in referer else "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def _apply_client_key(session: requests.Session, prefix: str) -> None:
     tz = -480
     day = time.time() / 86400 - tz / 1440
     client_key = f"{prefix}{tz}|{day}|{day}"
     session.cookies.set("CLIENT_KEY", client_key, domain="goodinfo.tw", path="/")
+
+
+def ensure_goodinfo_client_key(session: requests.Session, timeout: int = 30, force_refresh: bool = False) -> None:
+    if not force_refresh:
+        has_key = any(c.name == "CLIENT_KEY" and "goodinfo.tw" in (c.domain or "") for c in session.cookies)
+        if has_key:
+            return
+    else:
+        try:
+            session.cookies.clear(domain="goodinfo.tw", path="/", name="CLIENT_KEY")
+        except Exception:
+            pass
+
+    # 單一 GET https://goodinfo.tw/tw/ 在部分網路／時段會回 500；改依序嘗試多個入口頁取得 setCookie，
+    # 若皆失敗則沿用與「頁面無 CLIENT_KEY」相同的預設 prefix（與舊行為一致，仍可能成功 POST）。
+    sid_chart = up.quote("加權指數", safe="")
+    seed_urls = [
+        "https://goodinfo.tw/",
+        BASE_URL,
+        f"{BASE_URL}ShowK_Chart.asp?STOCK_ID={sid_chart}",
+    ]
+    prefix = "2.4|0|0|"
+
+    for i, url in enumerate(seed_urls):
+        ref = "https://goodinfo.tw/" if i == 0 else "https://goodinfo.tw/"
+        try:
+            r = session.get(url, headers=_goodinfo_seed_headers(referer=ref), timeout=timeout)
+            if r.status_code != 200:
+                continue
+            r.encoding = r.apparent_encoding or "utf-8"
+            prefix = _extract_cookie_prefix(r.text)
+            break
+        except requests.RequestException:
+            continue
+
+    _apply_client_key(session, prefix)
 
 
 def fetch_goodinfo_html_post(
@@ -150,7 +195,6 @@ def fetch_goodinfo_html_post(
     query_url: str = "",
     referer_url: str = "",
 ) -> tuple[str, str]:
-    ensure_goodinfo_client_key(session, timeout=timeout)
     post_url = query_url or url
     referer = referer_url or "https://goodinfo.tw/"
     headers = {
@@ -164,7 +208,16 @@ def fetch_goodinfo_html_post(
 
     # 注意：必須送出 data，否則 goodinfo 可能回傳非預期頁面，
     # 導致後續 pd.read_html 找不到目標欄位（例如「期別/交易日期」）。
-    resp = session.post(post_url, headers=headers, data=data, timeout=timeout)
+    # 伺服器偶發 5xx：重試幾次並刷新 CLIENT_KEY。
+    resp = None
+    for attempt in range(3):
+        ensure_goodinfo_client_key(session, timeout=timeout, force_refresh=(attempt > 0))
+        resp = session.post(post_url, headers=headers, data=data, timeout=timeout)
+        if resp.status_code < 500:
+            break
+        if attempt < 2:
+            time.sleep(0.45 + 0.35 * attempt)
+    assert resp is not None
     resp.raise_for_status()
     # 避免強制 utf-8，改用 requests 推斷的編碼
     resp.encoding = resp.apparent_encoding or "utf-8"

@@ -21,7 +21,6 @@ import streamlit as st
 import numpy as np
 # 須存取 parent document 的內嵌腳本：st.iframe 沙盒較嚴，Cloud 上易失效，故仍用 components.html。
 import streamlit.components.v1 as components
-from streamlit_autorefresh import st_autorefresh
 
 # 確保可 import tw_index_futur（同層 clone：tw_index_futur 在 app.py 所在目錄；monorepo：在上層目錄）
 # 僅在目錄存在時加入 sys.path，避免 standalone 部署時指到不存在的 /mount/src/tw_index_futur。
@@ -220,19 +219,14 @@ def _cached_bottom_strategy_summary(
         return None, str(e)
 
 
-@st.cache_data(show_spinner="下載週線與日線…")
-def load_market_data(ticker: str, start_date: str, _refresh_key: str):
-    """依代號與起始日抓取週線狀態機 + 日線（含週結束日）；以 _refresh_key 每分鐘失效快取。"""
+@st.cache_data(show_spinner="下載週線與日線…", ttl=1800)
+def load_market_data(ticker: str, start_date: str):
+    """依代號與起始日抓取週線狀態機 + 日線（含週結束日）；快取 30 分鐘，避免自動每分鐘重抓。"""
     df_w = fetch_weekly_stock_data(ticker, start_date=start_date)
     stats = calculate_long_position_stats(df_w)
     df_d = fetch_daily_chinese(ticker, start_date=start_date)
     daily_we, _ = build_daily_with_week_end(df_d)
     return df_w, stats, daily_we
-
-
-def _market_refresh_key() -> str:
-    """做多段資料刷新鍵：全天每分鐘一個 key，與 st_autorefresh 對齊。"""
-    return datetime.now().strftime("mkt-%Y%m%d-%H%M")
 
 
 def _bottom_refresh_key() -> str:
@@ -1031,14 +1025,11 @@ components.html(
     width=0,
 )
 
-# 做多段：全天每分鐘自動 rerun（底部策略仍依自身 refresh key，每 30 分鐘才換快取）。
-st_autorefresh(interval=60_000, limit=None, key="long_underwater_dynamic_refresh")
-
 with st.sidebar:
     st.markdown("#### 設定")
     ticker = st.text_input("股票代號", value="^TWII")
     start_date = st.text_input("資料起始日", value="2020-01-01")
-    st.caption("做多段：全天每分鐘更新；底部策略固定每 30 分鐘更新。")
+    st.caption("做多段資料快取約 30 分鐘；變更代號／起始日或重新整理頁面可立即重抓。底部策略快取每 30 分鐘輪替。")
 
 _t = ticker.strip()
 _sd = start_date.strip()
@@ -1069,7 +1060,7 @@ with ThreadPoolExecutor(max_workers=2) as executor:
             _bottom_refresh_key(),
             _bs_trade_date_str,
         ): "bs",
-        executor.submit(load_market_data, _t, _sd, _market_refresh_key()): "market",
+        executor.submit(load_market_data, _t, _sd): "market",
     }
     if _allow_partial_latest:
         futures[executor.submit(_cached_bottom_strategy_partial_latest, _bottom_refresh_key())] = "bs_partial"

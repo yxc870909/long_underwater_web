@@ -19,7 +19,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import numpy as np
-import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 # 確保可 import tw_index_futur（同層 clone：tw_index_futur 在 app.py 所在目錄；monorepo：在上層目錄）
@@ -500,7 +499,7 @@ def _render_bottom_strategy_panel(
             label_visibility="collapsed",
         )
 
-        components.html(
+        st.iframe(
             """
             <script>
             (function () {
@@ -960,7 +959,7 @@ st.markdown(
 )
 
 # 行動端手勢：頁面最上方下拉可重新整理（Pull-to-Refresh）
-components.html(
+st.iframe(
     """
     <script>
     (function () {
@@ -1129,7 +1128,7 @@ choice = st.selectbox(
     key=f"做多段選擇_{_t}_{_sd}",
 )
 # st.selectbox 無法為單一選項上色；以標籤中的「 · 虧損」為記號，在主文件為選項與已選文字套用下跌綠（與 K 線一致）。
-components.html(
+st.iframe(
     """<script>
 (function () {
   var GREEN = "#15803d";
@@ -1459,7 +1458,7 @@ else:
     )
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         config={"scrollZoom": False, "doubleClick": False},
     )
 
@@ -1477,7 +1476,7 @@ if "週對應出場價" in seg_weekly.columns:
     display_cols.append("週對應出場價")
 display_w = seg_weekly[display_cols].copy()
 display_w["日期"] = display_w["日期"].dt.strftime("%Y-%m-%d")
-st.dataframe(display_w, use_container_width=True, hide_index=True)
+st.dataframe(display_w, width="stretch", hide_index=True)
 
 st.markdown('<div style="height:120px"></div>', unsafe_allow_html=True)
 

@@ -10,6 +10,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -32,12 +33,34 @@ _tw_path = _STK_ROOT / "tw_index_futur"
 if _tw_path.is_dir() and str(_tw_path) not in sys.path:
     sys.path.insert(0, str(_tw_path))
 
+
+def _resolve_yfinance_cache_dir(root: Path) -> Path:
+    """取得可寫入的 yfinance 快取目錄。Streamlit Community Cloud 等環境下 repo 可能唯讀，勿只寫在專案根。"""
+    candidates = [
+        root / ".yfinance_cache",
+        Path.home() / ".cache" / "long_underwater_web" / "yfinance",
+        Path(tempfile.gettempdir()) / "long_underwater_web_yfinance",
+    ]
+    for p in candidates:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            probe = p / ".write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return p
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir())
+
+
 # yfinance 預設把 SQLite 快取放在 user_cache_dir；若目錄不可寫或異常會報 unable to open database file
-_yf_cache_dir = _STK_ROOT / ".yfinance_cache"
-_yf_cache_dir.mkdir(parents=True, exist_ok=True)
+_yf_cache_dir = _resolve_yfinance_cache_dir(_STK_ROOT)
 import yfinance as yf  # noqa: E402
 
-yf.set_tz_cache_location(str(_yf_cache_dir))
+try:
+    yf.set_tz_cache_location(str(_yf_cache_dir))
+except Exception:
+    pass
 
 from logic import (  # noqa: E402
     build_daily_with_week_end,

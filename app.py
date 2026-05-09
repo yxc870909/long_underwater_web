@@ -108,7 +108,7 @@ def _cached_bottom_strategy_summary(
             requests_spec["k"]["data"],
             timeout=cfg.timeout_sec,
             fallback_url=legacy_urls["k"],
-            allow_legacy_fallback=False,
+            allow_legacy_fallback=True,
             query_url=requests_spec["k"]["query_url"],
             referer_url=requests_spec["k"]["referer_url"],
         )
@@ -118,7 +118,7 @@ def _cached_bottom_strategy_summary(
             requests_spec["buy"]["data"],
             timeout=cfg.timeout_sec,
             fallback_url=legacy_urls["buy"],
-            allow_legacy_fallback=False,
+            allow_legacy_fallback=True,
             query_url=requests_spec["buy"]["query_url"],
             referer_url=requests_spec["buy"]["referer_url"],
         )
@@ -128,7 +128,7 @@ def _cached_bottom_strategy_summary(
             requests_spec["margin"]["data"],
             timeout=cfg.timeout_sec,
             fallback_url=legacy_urls["margin"],
-            allow_legacy_fallback=False,
+            allow_legacy_fallback=True,
             query_url=requests_spec["margin"]["query_url"],
             referer_url=requests_spec["margin"]["referer_url"],
         )
@@ -317,7 +317,7 @@ def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | No
             requests_spec["k"]["data"],
             timeout=30,
             fallback_url=legacy_urls["k"],
-            allow_legacy_fallback=False,
+            allow_legacy_fallback=True,
             query_url=requests_spec["k"]["query_url"],
             referer_url=requests_spec["k"]["referer_url"],
         )
@@ -327,7 +327,7 @@ def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | No
             requests_spec["buy"]["data"],
             timeout=30,
             fallback_url=legacy_urls["buy"],
-            allow_legacy_fallback=False,
+            allow_legacy_fallback=True,
             query_url=requests_spec["buy"]["query_url"],
             referer_url=requests_spec["buy"]["referer_url"],
         )
@@ -337,7 +337,7 @@ def _cached_bottom_strategy_partial_latest(_refresh_key: str) -> tuple[dict | No
             requests_spec["margin"]["data"],
             timeout=30,
             fallback_url=legacy_urls["margin"],
-            allow_legacy_fallback=False,
+            allow_legacy_fallback=True,
             query_url=requests_spec["margin"]["query_url"],
             referer_url=requests_spec["margin"]["referer_url"],
         )

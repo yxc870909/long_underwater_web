@@ -192,7 +192,7 @@ def fetch_goodinfo_html_post(
     data: Dict[str, str],
     timeout: int = 30,
     fallback_url: str = "",
-    allow_legacy_fallback: bool = False,
+    allow_legacy_fallback: bool = True,
     query_url: str = "",
     referer_url: str = "",
 ) -> tuple[str, str]:

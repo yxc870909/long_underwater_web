@@ -3,11 +3,15 @@ import time
 import urllib.parse as up
 from dataclasses import dataclass
 from io import StringIO
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 
+try:
+    from curl_cffi import requests as cf_requests  # type: ignore[attr-defined]
+except ImportError:
+    cf_requests = None
 
 BASE_URL = "https://goodinfo.tw/tw/"
 DATA_BASE_URL = "https://goodinfo.tw/tw/data/"
@@ -186,6 +190,77 @@ def ensure_goodinfo_client_key(session: requests.Session, timeout: int = 30, for
     _apply_client_key(session, prefix)
 
 
+def _warmup_referer(session: requests.Session, referer_url: str, timeout: int) -> None:
+    """先載入圖表頁建立 cookie／來源脈絡，降低 data POST 被擋（尤其雲端機房 IP）。"""
+    if not referer_url:
+        return
+    try:
+        session.get(
+            referer_url,
+            headers=_goodinfo_seed_headers(referer="https://goodinfo.tw/"),
+            timeout=min(timeout, 20),
+        )
+    except requests.RequestException:
+        pass
+
+
+def _try_curl_cffi_fetch_chain(
+    post_url: str,
+    data: Dict[str, str],
+    fallback_url: str,
+    referer_url: str,
+    timeout: float,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    使用 curl_cffi 模擬 Chrome TLS／HTTP2，略過部分資料中心對 requests 的空白回應。
+    若環境未安裝 curl_cffi 則回傳 (None, None)。
+    """
+    if cf_requests is None:
+        return None, None
+    impersonate = "chrome131"
+    xhr_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Referer": referer_url,
+        "Origin": "https://goodinfo.tw",
+        "Accept": "text/html, */*; q=0.01",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    nav_headers = {
+        "User-Agent": xhr_headers["User-Agent"],
+        "Referer": referer_url,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": xhr_headers["Accept-Language"],
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        s = cf_requests.Session()
+        for seed in ("https://goodinfo.tw/", BASE_URL, referer_url):
+            try:
+                s.get(seed, impersonate=impersonate, timeout=timeout)
+                break
+            except Exception:
+                continue
+
+        r = s.post(post_url, data=data, headers=xhr_headers, impersonate=impersonate, timeout=timeout)
+        text = r.text if r is not None else ""
+        if text and "<table" in text.lower():
+            return text, "curl_cffi_post"
+
+        if fallback_url:
+            r2 = s.get(fallback_url, headers=nav_headers, impersonate=impersonate, timeout=timeout)
+            text2 = r2.text if r2 is not None else ""
+            if text2 and "<table" in text2.lower():
+                return text2, "curl_cffi_legacy"
+    except Exception:
+        return None, None
+    return None, None
+
+
 def fetch_goodinfo_html_post(
     session: requests.Session,
     url: str,
@@ -203,6 +278,7 @@ def fetch_goodinfo_html_post(
         "Referer": referer,
         "Origin": "https://goodinfo.tw",
         "Accept": "text/html, */*; q=0.01",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
     }
@@ -213,6 +289,7 @@ def fetch_goodinfo_html_post(
     resp = None
     for attempt in range(3):
         ensure_goodinfo_client_key(session, timeout=timeout, force_refresh=(attempt > 0))
+        _warmup_referer(session, referer, timeout)
         resp = session.post(post_url, headers=headers, data=data, timeout=timeout)
         if resp.status_code < 500:
             break
@@ -226,6 +303,14 @@ def fetch_goodinfo_html_post(
     if "<table" in html.lower():
         return html, "data_post"
 
+    # 回應過短／無表格：常見於機房 IP 被給空 body，改走 curl_cffi
+    if (not html.strip() or len(html.strip()) < 80) and cf_requests is not None and fallback_url:
+        cf_html, cf_tag = _try_curl_cffi_fetch_chain(
+            post_url, data, fallback_url, referer, float(timeout)
+        )
+        if cf_html and "<table" in cf_html.lower():
+            return cf_html, cf_tag or "curl_cffi"
+
     resp2 = session.get(
         post_url,
         headers={"User-Agent": headers["User-Agent"], "Referer": headers["Referer"]},
@@ -238,13 +323,27 @@ def fetch_goodinfo_html_post(
         return html2, "data_get"
 
     if fallback_url and allow_legacy_fallback:
-        legacy_headers = {"User-Agent": headers["User-Agent"], "Referer": "https://goodinfo.tw/"}
+        # Legacy 整頁 GET：Referer 須貼近實際圖表頁，僅 goodinfo.tw 根網址易被給空頁
+        legacy_headers = {
+            "User-Agent": headers["User-Agent"],
+            "Referer": referer,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": headers.get("Accept-Language", "zh-TW,zh;q=0.9"),
+            "Upgrade-Insecure-Requests": "1",
+        }
         resp3 = session.get(fallback_url, headers=legacy_headers, timeout=timeout)
         resp3.raise_for_status()
         resp3.encoding = resp3.apparent_encoding or "utf-8"
         html3 = resp3.text
         if "<table" in html3.lower():
             return html3, "legacy_get"
+
+        cf_html, cf_tag = _try_curl_cffi_fetch_chain(
+            post_url, data, fallback_url, referer, float(timeout)
+        )
+        if cf_html and "<table" in cf_html.lower():
+            return cf_html, cf_tag or "curl_cffi"
+
         preview = (html3 or html2 or html).strip().replace("\n", " ")[:220]
         raise ValueError(
             "抓取失敗：回應不含表格（"

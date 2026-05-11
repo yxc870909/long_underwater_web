@@ -476,30 +476,31 @@ def _render_bottom_strategy_panel(
 
     if show_controls:
         # 注意：避免在 `st.date_input(key="bs_trade_date")` 實例化之後再修改同一個 key。
-        # 保留原本 widget 以維持狀態與邏輯，但移出畫面；由上面的 icon 按鈕觸發它們。
-        hidden_prev = st.button("◀", key="bs_trade_date_prev")
-        if hidden_prev and cur_date > min_bs_date:
-            st.session_state["bs_trade_date"] = max(min_bs_date, cur_date - timedelta(days=1))
-            st.rerun()
+        # 保留原本 widget 以維持狀態與邏輯，但放到 sidebar 避免主畫面被佔位。
+        with st.sidebar:
+            hidden_prev = st.button("◀", key="bs_trade_date_prev")
+            if hidden_prev and cur_date > min_bs_date:
+                st.session_state["bs_trade_date"] = max(min_bs_date, cur_date - timedelta(days=1))
+                st.rerun()
 
-        hidden_next = st.button("▶", key="bs_trade_date_next")
-        if hidden_next and cur_date < max_bs_date:
-            st.session_state["bs_trade_date"] = min(max_bs_date, cur_date + timedelta(days=1))
-            st.rerun()
+            hidden_next = st.button("▶", key="bs_trade_date_next")
+            if hidden_next and cur_date < max_bs_date:
+                st.session_state["bs_trade_date"] = min(max_bs_date, cur_date + timedelta(days=1))
+                st.rerun()
 
-        st.date_input(
-            "底部策略日期（最近一年）",
-            min_value=min_bs_date,
-            max_value=max_bs_date,
-            key="bs_trade_date",
-            label_visibility="collapsed",
-        )
+            st.date_input(
+                "底部策略日期（最近一年）",
+                min_value=min_bs_date,
+                max_value=max_bs_date,
+                key="bs_trade_date",
+                label_visibility="collapsed",
+            )
 
-        components.html(
+        st.html(
             """
             <script>
             (function () {
-              var DOC = window.parent.document;
+              var DOC = window.parent && window.parent.document ? window.parent.document : document;
               function qs(sel){ try { return DOC.querySelector(sel); } catch(e){ return null; } }
               function bindOnce(id, fn){
                 var el = qs('#' + id);
@@ -518,7 +519,6 @@ def _render_bottom_strategy_panel(
                 if (btn) btn.click();
               }
               function openCalendar(){
-                // 依據不同 Streamlit/版本，input/層級可能略有差異：多嘗試幾種 selector。
                 var input = qs('div.st-key-bs_trade_date input[data-testid="stDateInputField"]');
                 if (!input) input = qs('div[data-testid="stDateInput"] input[data-testid="stDateInputField"]');
                 if (input) {
@@ -526,8 +526,6 @@ def _render_bottom_strategy_panel(
                   input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
                   return;
                 }
-
-                // fallback：點擊 base input 容器（通常可觸發 datepicker 開啟）
                 var base = qs('div.st-key-bs_trade_date div[data-baseweb="input"]');
                 if (!base) base = qs('div[data-testid="stDateInput"] div[data-baseweb="input"]');
                 if (base) base.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
@@ -538,8 +536,7 @@ def _render_bottom_strategy_panel(
               bindOnce('bsCal', openCalendar);
             })();
             </script>
-            """,
-            height=0,
+            """
         )
 
     if use_partial and partial_latest:
@@ -630,7 +627,8 @@ st.markdown(
       --accent-blue: #2563eb;
     }
     [data-testid="stAppDeployButton"] { display: none !important; }
-    [data-testid="stAppViewContainer"] .block-container { padding-top: 0 !important; }
+    /* 桌機版預留頂部安全距，避免被 Streamlit 功能列蓋住 */
+    [data-testid="stAppViewContainer"] .block-container { padding-top: 2.4rem !important; }
     [data-testid="stMain"] { padding-top: 0 !important; }
     [data-testid="stMainBlockContainer"] { padding-top: 0 !important; }
     div.stElementContainer,
@@ -643,6 +641,15 @@ st.markdown(
     div[data-testid="stElementContainer"] > div {
       margin: 0 !important;
       padding: 0 !important;
+    }
+    /* 第二層補強：將零高度 script/html 容器壓到不佔版面 */
+    div.stElementContainer:has(> div[style*="height: 0px"]),
+    div[data-testid="stElementContainer"]:has(> div[style*="height: 0px"]) {
+      min-height: 0 !important;
+      height: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      overflow: hidden !important;
     }
     .v2-kpi-strip {
       display: flex;
@@ -922,9 +929,11 @@ st.markdown(
       padding: 0 !important;
       margin: 0 !important;
     }
+
     @media (max-width: 768px) {
       [data-testid="stAppViewContainer"] .block-container {
-        padding: 0 0.75rem 1rem 0.75rem !important;
+        /* 手機版需預留頂部安全距，避免被 Streamlit 功能列覆蓋 */
+        padding: 2.9rem 0.75rem 1rem 0.75rem !important;
       }
       h1 {
         font-size: 1.35rem !important;
